@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Body -->
+  <ellipse cx="64" cy="72" rx="28" ry="36" fill="#4CAF50" stroke="#2E7D32" stroke-width="2"/>
+  <!-- Body segments -->
+  <ellipse cx="64" cy="85" rx="26" ry="12" fill="#66BB6A" stroke="#2E7D32" stroke-width="1"/>
+  <ellipse cx="64" cy="95" rx="24" ry="10" fill="#81C784" stroke="#2E7D32" stroke-width="1"/>
+  <!-- Head -->
+  <ellipse cx="64" cy="42" rx="22" ry="18" fill="#43A047" stroke="#2E7D32" stroke-width="2"/>
+  <!-- Eyes on stalks -->
+  <line x1="50" y1="36" x2="38" y2="20" stroke="#2E7D32" stroke-width="3" stroke-linecap="round"/>
+  <line x1="78" y1="36" x2="90" y2="20" stroke="#2E7D32" stroke-width="3" stroke-linecap="round"/>
+  <!-- Eye balls - rainbow colored (mantis shrimp see many colors!) -->
+  <circle cx="36" cy="18" r="8" fill="#FF5722" stroke="#BF360C" stroke-width="1.5"/>
+  <circle cx="36" cy="18" r="5" fill="#FF9800"/>
+  <circle cx="36" cy="18" r="3" fill="#FFEB3B"/>
+  <circle cx="34" cy="16" r="1.5" fill="white"/>
+  <circle cx="92" cy="18" r="8" fill="#2196F3" stroke="#0D47A1" stroke-width="1.5"/>
+  <circle cx="92" cy="18" r="5" fill="#9C27B0"/>
+  <circle cx="92" cy="18" r="3" fill="#E91E63"/>
+  <circle cx="90" cy="16" r="1.5" fill="white"/>
+  <!-- Smasher claws -->
+  <path d="M42 50 Q28 45 22 55 Q18 62 26 65 Q32 67 38 60 Z" fill="#F44336" stroke="#C62828" stroke-width="2"/>
+  <path d="M86 50 Q100 45 106 55 Q110 62 102 65 Q96 67 90 60 Z" fill="#F44336" stroke="#C62828" stroke-width="2"/>
+  <!-- Claw arms -->
+  <path d="M48 52 L42 50" stroke="#2E7D32" stroke-width="3" stroke-linecap="round"/>
+  <path d="M80 52 L86 50" stroke="#2E7D32" stroke-width="3" stroke-linecap="round"/>
+  <!-- Antennae -->
+  <path d="M56 32 Q48 14 40 8" stroke="#FFC107" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <path d="M72 32 Q80 14 88 8" stroke="#FFC107" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <!-- Tail fan -->
+  <path d="M50 106 Q44 118 38 120 Q44 122 52 114 Z" fill="#FF9800" stroke="#E65100" stroke-width="1"/>
+  <path d="M58 108 Q56 120 54 124 Q60 122 62 114 Z" fill="#FFC107" stroke="#F57F17" stroke-width="1"/>
+  <path d="M70 108 Q72 120 74 124 Q68 122 66 114 Z" fill="#FFC107" stroke="#F57F17" stroke-width="1"/>
+  <path d="M78 106 Q84 118 90 120 Q84 122 76 114 Z" fill="#FF9800" stroke="#E65100" stroke-width="1"/>
+  <!-- Mouth / smile -->
+  <path d="M56 48 Q64 54 72 48" stroke="#1B5E20" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <!-- Body color bands (mantis shrimp are colorful!) -->
+  <rect x="48" y="68" width="32" height="4" rx="2" fill="#FF5722" opacity="0.5"/>
+  <rect x="46" y="76" width="36" height="4" rx="2" fill="#FF9800" opacity="0.5"/>
+  <rect x="44" y="84" width="40" height="4" rx="2" fill="#FFEB3B" opacity="0.5"/>
+  <rect x="46" y="92" width="36" height="4" rx="2" fill="#2196F3" opacity="0.5"/>
+  <!-- Small legs -->
+  <line x1="46" y1="72" x2="36" y2="78" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+  <line x1="46" y1="80" x2="36" y2="86" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+  <line x1="46" y1="88" x2="36" y2="94" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+  <line x1="82" y1="72" x2="92" y2="78" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+  <line x1="82" y1="80" x2="92" y2="86" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+  <line x1="82" y1="88" x2="92" y2="94" stroke="#2E7D32" stroke-width="2" stroke-linecap="round"/>
+</svg>
