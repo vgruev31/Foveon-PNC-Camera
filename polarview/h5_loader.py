@@ -121,7 +121,8 @@ def load_h5(file_path: str | Path) -> H5Info:
 
         raw: np.ndarray = f["camera"]["frames"][()]
         raw = _reorder_raw(raw)
-        info.raw_data = raw
+        # Sensor data has 2 zero LSBs; divide by 4 to get effective 14-bit values.
+        info.raw_data = raw // 4
 
         # --- Frame rate from integration-time ---
         frame_rate = 10.0

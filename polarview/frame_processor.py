@@ -28,6 +28,7 @@ class ProcessingParams:
     top_thresh: ChannelThresholds = field(default_factory=ChannelThresholds)
     middle_thresh: ChannelThresholds = field(default_factory=ChannelThresholds)
     bottom_thresh: ChannelThresholds = field(default_factory=ChannelThresholds)
+    is_uv: bool = False  # True when the H5 file is a UV file
 
 
 def _apply_threshold_and_colormap(
@@ -74,7 +75,7 @@ def process_single_frame(
 
     1. Extract raw frame as float64.
     2. Subsample channels at ``[::2, ::2]`` (MATLAB ``1:2:end``).
-    3. Normalise by ``2**15``.
+    3. Normalise by ``2**14``.
     4. Optional median filter.
     5. Per-channel threshold clamping + jet colormap.
     """
@@ -86,31 +87,45 @@ def process_single_frame(
     # Channel extraction with 2×2 subsampling
     # MATLAB: TOP = channel 3 (index 2), MIDDLE = channel 2 (index 1),
     #         BOTTOM = channel 1 (index 0)
-    top_tmp = raw[::2, ::2, 2] / (2**15)
-    middle_tmp = raw[::2, ::2, 1] / (2**15)
-    bottom_tmp = raw[::2, ::2, 0] / (2**15)
+    top_tmp = raw[::2, ::2, 2] / (2**14)
+    middle_tmp = raw[::2, ::2, 1] / (2**14)
+    bottom_tmp = raw[::2, ::2, 0] / (2**14)
 
-    # Build COLOR composite from UNFILTERED channels: Bottom=Red, Middle=Green, Top=Blue.
-    # Normalise each channel independently to [0, 1] so the colour
-    # differences are visible (raw channels share a similar intensity range).
     def _normalise(ch: np.ndarray) -> np.ndarray:
         lo, hi = ch.min(), ch.max()
         if hi > lo:
             return (ch - lo) / (hi - lo)
         return np.zeros_like(ch)
 
-    video_data.color[:, :, 0] = _normalise(bottom_tmp)   # Red
-    video_data.color[:, :, 1] = _normalise(middle_tmp)    # Green
-    video_data.color[:, :, 2] = _normalise(top_tmp)       # Blue
-
-    # Optional median filter applied ONLY to the 3 sub-images (not COLOR)
+    # When median filter is active, normalise first (using original range),
+    # then filter the normalised data for COLOR. This preserves the full
+    # dynamic range and avoids washed-out results.
     if params.filter_tap > 0:
         k = params.filter_tap
+
+        # Apply median filter to sub-images (for TOP/MIDDLE/BOTTOM jet images)
         top_tmp = median_filter(top_tmp, size=(k, k), mode="constant", cval=0.0)
         middle_tmp = median_filter(middle_tmp, size=(k, k), mode="constant", cval=0.0)
-        bottom_tmp = median_filter(
-            bottom_tmp, size=(k, k), mode="constant", cval=0.0
+        bottom_tmp = median_filter(bottom_tmp, size=(k, k), mode="constant", cval=0.0)
+
+        # COLOR: normalise using original range, then median filter
+        video_data.color[:, :, 0] = median_filter(
+            _normalise(raw[::2, ::2, 0] / (2**14)),
+            size=(k, k), mode="constant", cval=0.0,
         )
+        video_data.color[:, :, 1] = median_filter(
+            _normalise(raw[::2, ::2, 1] / (2**14)),
+            size=(k, k), mode="constant", cval=0.0,
+        )
+        video_data.color[:, :, 2] = median_filter(
+            _normalise(raw[::2, ::2, 2] / (2**14)),
+            size=(k, k), mode="constant", cval=0.0,
+        )
+    else:
+        # No filter: COLOR from unfiltered channels
+        video_data.color[:, :, 0] = _normalise(bottom_tmp)   # Red
+        video_data.color[:, :, 1] = _normalise(middle_tmp)    # Green
+        video_data.color[:, :, 2] = _normalise(top_tmp)       # Blue
 
     # Threshold + jet colormap for each channel
     video_data.top[:] = _apply_threshold_and_colormap(

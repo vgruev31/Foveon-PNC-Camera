@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import csv
 import datetime
 import os
+import shutil
 from pathlib import Path
 
 import h5py
 import numpy as np
+from PIL import Image
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -32,6 +36,7 @@ from .image_saver import save_images
 from .video_data import H5File, H5Info, VideoData
 from .widgets.frame_slider import FrameSlider
 from .widgets.image_panel import ImagePanel
+from .widgets.hsv_scatter_dialog import HSVScatterDialog
 from .widgets.threshold_panel import ThresholdPanel
 
 
@@ -106,8 +111,6 @@ class PolarViewMainWindow(QMainWindow):
         self._filter_combo = QComboBox()
         self._filter_combo.addItems(["None", "3", "5", "7", "9", "11"])
         nav_row.addWidget(self._filter_combo)
-        self._save_btn = QPushButton("Save Images")
-        nav_row.addWidget(self._save_btn)
         main_layout.addLayout(nav_row)
 
         # --- Row 1c: Rename H5 file ---
@@ -118,6 +121,12 @@ class PolarViewMainWindow(QMainWindow):
         self._rename_spin.setValue(1)
         self._rename_spin.setFixedWidth(70)
         rename_row.addWidget(self._rename_spin)
+        rename_row.addWidget(QLabel("_Sample_"))
+        self._sample_spin = QSpinBox()
+        self._sample_spin.setRange(0, 9999)
+        self._sample_spin.setValue(1)
+        self._sample_spin.setFixedWidth(70)
+        rename_row.addWidget(self._sample_spin)
         rename_row.addWidget(QLabel("_"))
         self._rename_tissue = QComboBox()
         self._rename_tissue.addItems(["LN", "TUMOR"])
@@ -126,11 +135,28 @@ class PolarViewMainWindow(QMainWindow):
         self._rename_descriptor = QComboBox()
         self._rename_descriptor.addItems(["COLOR", "COLOR_NIR", "NIR", "UV"])
         rename_row.addWidget(self._rename_descriptor)
+        self._cancerous_cb = QCheckBox("Cancerous Tissue")
+        rename_row.addWidget(self._cancerous_cb)
         self._rename_btn = QPushButton("Rename H5 File")
         self._rename_btn.setEnabled(False)
         rename_row.addWidget(self._rename_btn)
         rename_row.addStretch()
+        self._show_hsv_btn = QPushButton("Show HSV")
+        self._show_hsv_btn.setEnabled(False)
+        rename_row.addWidget(self._show_hsv_btn)
         main_layout.addLayout(rename_row)
+
+        # --- Row 1d: Save buttons ---
+        save_row = QHBoxLayout()
+        self._save_btn = QPushButton("Save Images")
+        save_row.addWidget(self._save_btn)
+        self._save_all_btn = QPushButton("Save ALL Images")
+        self._save_all_btn.setEnabled(False)
+        save_row.addWidget(self._save_all_btn)
+        self._save_uv_btn = QPushButton("Save UV Images")
+        self._save_uv_btn.setEnabled(False)
+        save_row.addWidget(self._save_uv_btn)
+        main_layout.addLayout(save_row)
 
         # --- Row 2: Frame slider ---
         self._frame_slider = FrameSlider()
@@ -178,6 +204,8 @@ class PolarViewMainWindow(QMainWindow):
         self._next_btn.clicked.connect(self._on_next_file)
         self._delete_btn.clicked.connect(self._on_delete_file)
         self._rename_btn.clicked.connect(self._on_rename_file)
+        self._save_all_btn.clicked.connect(self._on_save_all_images)
+        self._save_uv_btn.clicked.connect(self._on_save_uv_images)
         self._scrub_browse_btn.clicked.connect(self._on_scrub_browse)
         self._scrub_btn.clicked.connect(self._on_scrub_files)
         self._frame_slider.frame_changed.connect(self._on_frame_changed)
@@ -188,6 +216,9 @@ class PolarViewMainWindow(QMainWindow):
         self._color_thresh.thresholds_changed.connect(self._on_threshold_changed)
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         self._save_btn.clicked.connect(self._on_save)
+        self._rename_tissue.currentTextChanged.connect(self._on_tissue_changed)
+        self._show_hsv_btn.clicked.connect(self._on_show_hsv)
+        self._top_panel.roi_selected.connect(self._on_top_roi_selected)
 
     # -----------------------------------------------------------------
     # Callbacks
@@ -289,35 +320,48 @@ class PolarViewMainWindow(QMainWindow):
 
         old_path = self._h5_files[self._h5_file_index]
         num = self._rename_spin.value()
+        sample = self._sample_spin.value()
         descriptor = self._rename_descriptor.currentText()
         tissue = self._rename_tissue.currentText()
-        new_name = f"Subject_{num}_{tissue}_{descriptor}.h5"
-        new_path = old_path.parent / new_name
+        new_name = f"Subject_{num}_Sample_{sample}_{tissue}_{descriptor}.h5"
+        # Copy with new name into "renamed files" subfolder in the parent directory
+        dest_dir = old_path.parent.parent / "renamed files"
+        dest_dir.mkdir(exist_ok=True)
+        new_path = dest_dir / new_name
 
         if new_path.exists():
             QMessageBox.warning(
                 self, "Rename Failed",
-                f"A file named '{new_name}' already exists in this directory.",
+                f"A file named '{new_name}' already exists in:\n{dest_dir}",
             )
             return
 
         try:
-            old_path.rename(new_path)
+            shutil.copy2(old_path, new_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Rename Failed", str(exc))
+            QMessageBox.critical(self, "Copy Failed", str(exc))
             return
 
-        # Update internal file list and reload
-        self._h5_files[self._h5_file_index] = new_path
-        self._h5_files.sort()
-        self._h5_file_index = self._h5_files.index(new_path)
+        # Write CSV entry only for UV descriptor
+        if descriptor == "UV":
+            cancerous = 1 if self._cancerous_cb.isChecked() else 0
+            csv_path = dest_dir / "tissue_log.csv"
+            write_header = not csv_path.exists()
+            try:
+                with open(csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    if write_header:
+                        writer.writerow(["filename", "tissue_type", "cancerous"])
+                    writer.writerow([new_name, tissue, cancerous])
+            except Exception as exc:
+                QMessageBox.warning(self, "CSV Write Failed", str(exc))
 
-        self._h5file = H5File(name=new_path.stem, path=str(new_path.parent))
-        self._filename_edit.setText(str(new_path))
-        self._update_nav_buttons()
         self.statusBar().showMessage(
-            f"Renamed: {old_path.name} → {new_name}"
+            f"Copied: {old_path.name} → {dest_dir / new_name}"
         )
+
+    def _on_tissue_changed(self, tissue: str) -> None:
+        self._cancerous_cb.setChecked(tissue == "TUMOR")
 
     @staticmethod
     def _scrub_time_info(file_path: Path) -> None:
@@ -407,6 +451,9 @@ class PolarViewMainWindow(QMainWindow):
         )
         self._delete_btn.setEnabled(self._file_loaded)
         self._rename_btn.setEnabled(self._file_loaded)
+        self._save_all_btn.setEnabled(self._file_loaded)
+        self._save_uv_btn.setEnabled(self._file_loaded)
+        self._show_hsv_btn.setEnabled(self._file_loaded)
 
     def _load_file(self, p: Path) -> None:
         self.statusBar().showMessage(f"Loading {p}...")
@@ -468,6 +515,169 @@ class PolarViewMainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Failed", str(exc))
             self.statusBar().showMessage("Save failed")
 
+    def _on_save_all_images(self) -> None:
+        """Process every H5 file in the current directory and save all 4 images."""
+        if not self._file_loaded or not self._h5_files:
+            QMessageBox.warning(self, "No File", "No file loaded.")
+            return
+
+        h5_dir = self._h5_files[0].parent
+        all_h5 = sorted(h5_dir.glob("*.h5"))
+        if not all_h5:
+            return
+
+        params = self._get_processing_params()
+        params.frame_number = 0
+
+        saved_total = 0
+        errors = []
+        for i, fp in enumerate(all_h5):
+            self.statusBar().showMessage(
+                f"Saving ALL images: {i + 1}/{len(all_h5)} — {fp.name}"
+            )
+            QApplication.processEvents()
+            try:
+                info = load_h5(fp)
+                vd = VideoData()
+                vd.allocate(info.attr.rows, info.attr.columns)
+                p = ProcessingParams(
+                    frame_number=0,
+                    filter_tap=params.filter_tap,
+                    top_thresh=params.top_thresh,
+                    middle_thresh=params.middle_thresh,
+                    bottom_thresh=params.bottom_thresh,
+                    is_uv="UV" in fp.stem,
+                )
+                process_single_frame(info, vd, p)
+                h5f = H5File(name=fp.stem, path=str(fp.parent))
+                saved = save_images(vd, h5f)
+                saved_total += len(saved)
+            except Exception as exc:
+                errors.append(f"{fp.name}: {exc}")
+
+        msg = f"Saved {saved_total} images from {len(all_h5)} H5 files."
+        if errors:
+            msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
+        QMessageBox.information(self, "Save ALL Complete", msg)
+        self.statusBar().showMessage(f"Save ALL complete: {saved_total} images")
+
+    def _on_save_uv_images(self) -> None:
+        """Process every UV H5 file in the current directory and save the TOP and COLOR images."""
+        if not self._file_loaded or not self._h5_files:
+            QMessageBox.warning(self, "No File", "No file loaded.")
+            return
+
+        h5_dir = self._h5_files[0].parent
+        all_h5 = sorted(f for f in h5_dir.glob("*.h5") if "UV" in f.stem)
+        if not all_h5:
+            QMessageBox.information(self, "No UV Files", "No H5 files with 'UV' in the name found.")
+            return
+
+        output_dir = h5_dir / "Processed UV Images"
+        output_dir.mkdir(exist_ok=True)
+
+        params = self._get_processing_params()
+
+        saved_count = 0
+        errors = []
+        for i, fp in enumerate(all_h5):
+            self.statusBar().showMessage(
+                f"Saving UV images: {i + 1}/{len(all_h5)} — {fp.name}"
+            )
+            QApplication.processEvents()
+            try:
+                info = load_h5(fp)
+                vd = VideoData()
+                vd.allocate(info.attr.rows, info.attr.columns)
+                p = ProcessingParams(
+                    frame_number=0,
+                    filter_tap=params.filter_tap,
+                    top_thresh=params.top_thresh,
+                    middle_thresh=params.middle_thresh,
+                    bottom_thresh=params.bottom_thresh,
+                    is_uv=True,
+                )
+                process_single_frame(info, vd, p)
+
+                # Save TOP image (already [0, 255] from jet colormap)
+                top_img = np.clip(vd.top, 0.0, 255.0).astype(np.uint8)
+                top_path = output_dir / f"{fp.stem} TOP Image.png"
+                Image.fromarray(top_img, mode="RGB").save(str(top_path))
+
+                # Save COLOR image with threshold clamping (same as display)
+                color_low = self._color_thresh.low / 100.0
+                color_high = self._color_thresh.high / 100.0
+                color_img = vd.color.copy()
+                color_img[color_img < color_low] = 0.0
+                color_img[color_img > color_high] = 1.0
+                denom = color_high - color_low
+                if denom > 0:
+                    color_img = (color_img - color_low) / denom
+                else:
+                    color_img = np.zeros_like(color_img)
+                color_img = (np.clip(color_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                color_path = output_dir / f"{fp.stem} COLOR Image.png"
+                Image.fromarray(color_img, mode="RGB").save(str(color_path))
+
+                saved_count += 1
+            except Exception as exc:
+                errors.append(f"{fp.name}: {exc}")
+
+        msg = f"Saved {saved_count} UV images to:\n{output_dir}"
+        if errors:
+            msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
+        QMessageBox.information(self, "Save UV Complete", msg)
+        self.statusBar().showMessage(f"Save UV complete: {saved_count} images")
+
+    # -----------------------------------------------------------------
+    # HSV scatter plot
+    # -----------------------------------------------------------------
+    def _on_show_hsv(self) -> None:
+        """Enter polygon ROI selection mode on the TOP panel."""
+        if not self._file_loaded:
+            return
+        self.statusBar().showMessage(
+            "Click points on the TOP image to draw ROI polygon. "
+            "Right-click or double-click to finish."
+        )
+        self._top_panel.set_roi_mode(True)
+
+    def _on_top_roi_selected(self, vertices: list[tuple[int, int]]) -> None:
+        """Handle polygon ROI — extract thresholded RGB pixels and show HSV scatter."""
+        from matplotlib.path import Path as MplPath
+
+        self.statusBar().showMessage(
+            f"ROI polygon: {len(vertices)} vertices"
+        )
+        color_data = self._video_data.color  # (H, W, 3), [0, 1]
+        if color_data is None:
+            return
+
+        h, w = color_data.shape[:2]
+
+        # Build polygon path and mask
+        poly_path = MplPath(vertices)
+        yy, xx = np.mgrid[:h, :w]
+        coords = np.column_stack([xx.ravel(), yy.ravel()])
+        mask = poly_path.contains_points(coords).reshape(h, w)
+
+        # Only keep pixels where top channel is within the TOP lo-hi range
+        raw = self._video_data.raw_single_frame_double
+        top_ch = raw[::2, ::2, 2] / (2**14)
+        top_low = self._top_thresh.low / 100.0
+        top_high = self._top_thresh.high / 100.0
+        in_range = (top_ch >= top_low) & (top_ch <= top_high)
+        mask = mask & in_range
+
+        pixels = color_data[mask]  # (N, 3), [0, 1]
+        if pixels.size == 0:
+            QMessageBox.warning(self, "Empty ROI", "Selected region has no pixels.")
+            return
+
+        dialog = HSVScatterDialog(pixels, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
+
     # -----------------------------------------------------------------
     # Processing helpers
     # -----------------------------------------------------------------
@@ -476,6 +686,7 @@ class PolarViewMainWindow(QMainWindow):
         return 0 if text == "None" else int(text)
 
     def _get_processing_params(self) -> ProcessingParams:
+        is_uv = "UV" in self._h5file.name if self._h5file.name else False
         return ProcessingParams(
             frame_number=self._frame_slider.value,
             filter_tap=self._get_filter_tap(),
@@ -488,6 +699,7 @@ class PolarViewMainWindow(QMainWindow):
             bottom_thresh=ChannelThresholds(
                 self._bottom_thresh.low, self._bottom_thresh.high
             ),
+            is_uv=is_uv,
         )
 
     def _process_and_display(self) -> None:
