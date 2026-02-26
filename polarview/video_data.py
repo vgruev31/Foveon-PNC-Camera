@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 
 import numpy as np
+
+
+class CameraType(Enum):
+    """Supported camera sensor types."""
+
+    FOVEON = auto()  # Foveon stacked RGB (3 channels)
+    GSENSE = auto()  # GSense FSI Dual-Gain (monochrome, HG+LG)
+    UNKNOWN = auto()
 
 
 @dataclass
@@ -16,6 +25,9 @@ class H5Attributes:
     num_frames: int = 0
     frame_rate: float = 10.0
     camera: str = ""
+    camera_type: CameraType = CameraType.UNKNOWN
+    bit_shift: int = 0     # number of zero LSBs to strip (divide by 2^bit_shift)
+    norm_bits: int = 14    # effective bit depth for normalization (divide by 2^norm_bits)
 
 
 @dataclass

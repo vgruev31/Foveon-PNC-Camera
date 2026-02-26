@@ -9,13 +9,52 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .video_data import H5Attributes, H5Info
+from .video_data import CameraType, H5Attributes, H5Info
 
-NUM_CHANNELS = 3  # camera always has 3 photodiodes
+NUM_CHANNELS = 3  # Foveon camera always has 3 photodiodes
 
 
-def _reorder_raw(raw: np.ndarray) -> np.ndarray:
-    """Rearrange h5py data to ``(rows, cols, 3_channels, frames)``.
+def _detect_camera_type(cam_group: h5py.Group) -> tuple[CameraType, str]:
+    """Detect the camera type from HDF5 /camera group attributes.
+
+    Returns (CameraType, descriptive_string).
+    """
+    attrs = dict(cam_group.attrs) if cam_group.attrs else {}
+
+    # Check sensor-desc first (newer firmware)
+    sensor_desc = str(attrs.get("sensor-desc", ""))
+    if sensor_desc:
+        if "GSense" in sensor_desc or "GPIXEL" in sensor_desc:
+            return CameraType.GSENSE, sensor_desc
+        if "Foveon" in sensor_desc or "F13" in sensor_desc:
+            return CameraType.FOVEON, sensor_desc
+
+    # Check imager attribute (older firmware)
+    imager = str(attrs.get("imager", ""))
+    if imager:
+        if "X3" in imager or "Stacked" in imager:
+            return CameraType.FOVEON, imager
+
+    # Check model-name
+    model = str(attrs.get("model-name", ""))
+    if model:
+        if "GSense" in model:
+            return CameraType.GSENSE, model
+        if "Foveon" in model:
+            return CameraType.FOVEON, model
+
+    # Check manufacture
+    manufacture = str(attrs.get("manufacture", ""))
+    if "GPIXEL" in manufacture:
+        return CameraType.GSENSE, manufacture
+    if "Foveon" in manufacture:
+        return CameraType.FOVEON, manufacture
+
+    return CameraType.UNKNOWN, sensor_desc or imager or model or "unknown"
+
+
+def _reorder_foveon(raw: np.ndarray) -> np.ndarray:
+    """Rearrange Foveon h5py data to ``(rows, cols, 3_channels, frames)``.
 
     The camera has exactly 3 colour channels (photodiodes).  The logic:
 
@@ -29,7 +68,7 @@ def _reorder_raw(raw: np.ndarray) -> np.ndarray:
     If two dims are both 3, the one that matches known channel count is
     treated as channels; the other as frames.
     """
-    print(f"[h5_loader] Raw shape from h5py: {raw.shape}, ndim={raw.ndim}")
+    print(f"[h5_loader] Foveon raw shape: {raw.shape}, ndim={raw.ndim}")
 
     # ---- 3-D: single frame with 3 channels ----
     if raw.ndim == 3:
@@ -87,7 +126,7 @@ def _reorder_raw(raw: np.ndarray) -> np.ndarray:
         # Final safety check: axis 2 must be 3 (channels).
         # If it ended up as axis 3 instead, swap.
         if raw.shape[2] != NUM_CHANNELS and raw.shape[3] == NUM_CHANNELS:
-            print(f"[h5_loader] Swapping axes 2↔3 to fix channel/frame order")
+            print("[h5_loader] Swapping axes 2↔3 to fix channel/frame order")
             raw = np.swapaxes(raw, 2, 3)
 
         print(f"[h5_loader] 4-D reordered: {raw.shape}  "
@@ -101,8 +140,8 @@ def _reorder_raw(raw: np.ndarray) -> np.ndarray:
 def load_h5(file_path: str | Path) -> H5Info:
     """Load an HDF5 file and return an :class:`H5Info`.
 
-    Reads ``/camera/frames``, auto-detects the dimension layout, and
-    reorders to ``(rows, cols, 3_channels, frames)``.
+    Reads ``/camera/frames``, detects camera type from metadata,
+    and reorders/normalises accordingly.
     """
     file_path = Path(file_path)
     if not file_path.exists():
@@ -119,18 +158,41 @@ def load_h5(file_path: str | Path) -> H5Info:
                 f"File: {file_path}"
             )
 
-        raw: np.ndarray = f["camera"]["frames"][()]
-        raw = _reorder_raw(raw)
-        # Sensor data has 2 zero LSBs; divide by 4 to get effective 14-bit values.
-        info.raw_data = raw // 4
+        cam_group = f["camera"]
+
+        # --- Detect camera type ---
+        camera_type, camera_desc = _detect_camera_type(cam_group)
+        print(f"[h5_loader] Camera type: {camera_type.name}  ({camera_desc})")
+
+        # --- Load and process frames ---
+        raw: np.ndarray = cam_group["frames"][()]
+
+        if camera_type == CameraType.FOVEON:
+            raw = _reorder_foveon(raw)
+            # Foveon: 14-bit effective, 2 zero LSBs
+            info.raw_data = raw // 4
+            bit_shift = 2
+            norm_bits = 14
+        elif camera_type == CameraType.GSENSE:
+            # GSense: will be handled separately — store raw for now
+            # Shape is (frames, 2048, 4096, 1) — 12-bit effective, 4 zero LSBs
+            info.raw_data = raw // 16
+            bit_shift = 4
+            norm_bits = 12
+            print(f"[h5_loader] GSense raw shape: {raw.shape}")
+        else:
+            # Unknown camera — try Foveon-style reorder as fallback
+            print(f"[h5_loader] Unknown camera, attempting Foveon-style reorder")
+            raw = _reorder_foveon(raw)
+            info.raw_data = raw // 4
+            bit_shift = 2
+            norm_bits = 14
 
         # --- Frame rate from integration-time ---
         frame_rate = 10.0
         try:
-            if "integration-time" in f["camera"]:
-                integ_us = f["camera"]["integration-time"][()].astype(
-                    np.float64
-                )
+            if "integration-time" in cam_group:
+                integ_us = cam_group["integration-time"][()].astype(np.float64)
                 if integ_us.size > 0:
                     mean_integ = float(np.mean(integ_us))
                     if mean_integ > 0:
@@ -141,26 +203,16 @@ def load_h5(file_path: str | Path) -> H5Info:
         if not np.isfinite(frame_rate) or frame_rate <= 0:
             frame_rate = 30.0
 
-        # --- Camera attribute ---
-        camera = ""
-        try:
-            cam_group = f["camera"]
-            if cam_group.attrs:
-                if "Camera" in cam_group.attrs:
-                    camera = str(cam_group.attrs["Camera"])
-                elif len(cam_group.attrs) > 0:
-                    first_key = list(cam_group.attrs.keys())[0]
-                    camera = str(cam_group.attrs[first_key])
-        except Exception:
-            pass
-
         # --- Build attributes ---
         info.attr = H5Attributes(
-            rows=raw.shape[0],
-            columns=raw.shape[1],
-            num_frames=raw.shape[3],
+            rows=info.raw_data.shape[0],
+            columns=info.raw_data.shape[1],
+            num_frames=info.raw_data.shape[-1] if info.raw_data.ndim == 4 else 1,
             frame_rate=frame_rate,
-            camera=camera,
+            camera=camera_desc,
+            camera_type=camera_type,
+            bit_shift=bit_shift,
+            norm_bits=norm_bits,
         )
 
     return info

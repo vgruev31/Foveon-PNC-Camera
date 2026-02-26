@@ -29,6 +29,7 @@ class ProcessingParams:
     middle_thresh: ChannelThresholds = field(default_factory=ChannelThresholds)
     bottom_thresh: ChannelThresholds = field(default_factory=ChannelThresholds)
     is_uv: bool = False  # True when the H5 file is a UV file
+    norm_bits: int = 14  # effective bit depth for normalization
 
 
 def _apply_threshold_and_colormap(
@@ -75,7 +76,7 @@ def process_single_frame(
 
     1. Extract raw frame as float64.
     2. Subsample channels at ``[::2, ::2]`` (MATLAB ``1:2:end``).
-    3. Normalise by ``2**14``.
+    3. Normalise by ``2**norm_bits``.
     4. Optional median filter.
     5. Per-channel threshold clamping + jet colormap.
     """
@@ -83,13 +84,14 @@ def process_single_frame(
     video_data.raw_single_frame_double[:] = raw_frame
 
     raw = video_data.raw_single_frame_double
+    norm = 2 ** params.norm_bits
 
     # Channel extraction with 2×2 subsampling
     # MATLAB: TOP = channel 3 (index 2), MIDDLE = channel 2 (index 1),
     #         BOTTOM = channel 1 (index 0)
-    top_tmp = raw[::2, ::2, 2] / (2**14)
-    middle_tmp = raw[::2, ::2, 1] / (2**14)
-    bottom_tmp = raw[::2, ::2, 0] / (2**14)
+    top_tmp = raw[::2, ::2, 2] / norm
+    middle_tmp = raw[::2, ::2, 1] / norm
+    bottom_tmp = raw[::2, ::2, 0] / norm
 
     def _normalise(ch: np.ndarray) -> np.ndarray:
         lo, hi = ch.min(), ch.max()
@@ -110,15 +112,15 @@ def process_single_frame(
 
         # COLOR: normalise using original range, then median filter
         video_data.color[:, :, 0] = median_filter(
-            _normalise(raw[::2, ::2, 0] / (2**14)),
+            _normalise(raw[::2, ::2, 0] / norm),
             size=(k, k), mode="constant", cval=0.0,
         )
         video_data.color[:, :, 1] = median_filter(
-            _normalise(raw[::2, ::2, 1] / (2**14)),
+            _normalise(raw[::2, ::2, 1] / norm),
             size=(k, k), mode="constant", cval=0.0,
         )
         video_data.color[:, :, 2] = median_filter(
-            _normalise(raw[::2, ::2, 2] / (2**14)),
+            _normalise(raw[::2, ::2, 2] / norm),
             size=(k, k), mode="constant", cval=0.0,
         )
     else:

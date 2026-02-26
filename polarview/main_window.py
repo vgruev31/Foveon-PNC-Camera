@@ -141,6 +141,12 @@ class PolarViewMainWindow(QMainWindow):
         self._rename_btn.setEnabled(False)
         rename_row.addWidget(self._rename_btn)
         rename_row.addStretch()
+        rename_row.addWidget(QLabel("ROI:"))
+        self._roi_spin = QSpinBox()
+        self._roi_spin.setRange(1, 99)
+        self._roi_spin.setValue(1)
+        self._roi_spin.setFixedWidth(50)
+        rename_row.addWidget(self._roi_spin)
         self._show_hsv_btn = QPushButton("Show HSV")
         self._show_hsv_btn.setEnabled(False)
         rename_row.addWidget(self._show_hsv_btn)
@@ -547,6 +553,7 @@ class PolarViewMainWindow(QMainWindow):
                     middle_thresh=params.middle_thresh,
                     bottom_thresh=params.bottom_thresh,
                     is_uv="UV" in fp.stem,
+                    norm_bits=info.attr.norm_bits,
                 )
                 process_single_frame(info, vd, p)
                 h5f = H5File(name=fp.stem, path=str(fp.parent))
@@ -596,6 +603,7 @@ class PolarViewMainWindow(QMainWindow):
                     middle_thresh=params.middle_thresh,
                     bottom_thresh=params.bottom_thresh,
                     is_uv=True,
+                    norm_bits=info.attr.norm_bits,
                 )
                 process_single_frame(info, vd, p)
 
@@ -632,22 +640,26 @@ class PolarViewMainWindow(QMainWindow):
     # -----------------------------------------------------------------
     # HSV scatter plot
     # -----------------------------------------------------------------
+    _hsv_dialog: HSVScatterDialog | None = None
+
     def _on_show_hsv(self) -> None:
         """Enter polygon ROI selection mode on the TOP panel."""
         if not self._file_loaded:
             return
+        roi_num = self._roi_spin.value()
         self.statusBar().showMessage(
-            "Click points on the TOP image to draw ROI polygon. "
+            f"ROI {roi_num}: Click points on the TOP image to draw polygon. "
             "Right-click or double-click to finish."
         )
         self._top_panel.set_roi_mode(True)
 
     def _on_top_roi_selected(self, vertices: list[tuple[int, int]]) -> None:
-        """Handle polygon ROI — extract thresholded RGB pixels and show HSV scatter."""
+        """Handle polygon ROI — extract thresholded RGB pixels and add to HSV scatter."""
         from matplotlib.path import Path as MplPath
 
+        roi_num = self._roi_spin.value()
         self.statusBar().showMessage(
-            f"ROI polygon: {len(vertices)} vertices"
+            f"ROI {roi_num}: {len(vertices)} vertices"
         )
         color_data = self._video_data.color  # (H, W, 3), [0, 1]
         if color_data is None:
@@ -663,7 +675,7 @@ class PolarViewMainWindow(QMainWindow):
 
         # Only keep pixels where top channel is within the TOP lo-hi range
         raw = self._video_data.raw_single_frame_double
-        top_ch = raw[::2, ::2, 2] / (2**14)
+        top_ch = raw[::2, ::2, 2] / (2 ** self._h5info.attr.norm_bits)
         top_low = self._top_thresh.low / 100.0
         top_high = self._top_thresh.high / 100.0
         in_range = (top_ch >= top_low) & (top_ch <= top_high)
@@ -674,9 +686,20 @@ class PolarViewMainWindow(QMainWindow):
             QMessageBox.warning(self, "Empty ROI", "Selected region has no pixels.")
             return
 
-        dialog = HSVScatterDialog(pixels, parent=self)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.show()
+        # Create dialog on first ROI, reuse for subsequent ones
+        if self._hsv_dialog is None or not self._hsv_dialog.isVisible():
+            self._hsv_dialog = HSVScatterDialog(parent=self)
+            self._hsv_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            self._hsv_dialog.destroyed.connect(self._on_hsv_dialog_closed)
+            self._hsv_dialog.show()
+
+        self._hsv_dialog.add_roi(pixels, f"ROI {roi_num}")
+
+        # Auto-increment ROI number for convenience
+        self._roi_spin.setValue(roi_num + 1)
+
+    def _on_hsv_dialog_closed(self) -> None:
+        self._hsv_dialog = None
 
     # -----------------------------------------------------------------
     # Processing helpers
@@ -700,6 +723,7 @@ class PolarViewMainWindow(QMainWindow):
                 self._bottom_thresh.low, self._bottom_thresh.high
             ),
             is_uv=is_uv,
+            norm_bits=self._h5info.attr.norm_bits,
         )
 
     def _process_and_display(self) -> None:
