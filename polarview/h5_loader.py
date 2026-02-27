@@ -174,12 +174,16 @@ def load_h5(file_path: str | Path) -> H5Info:
             bit_shift = 2
             norm_bits = 14
         elif camera_type == CameraType.GSENSE:
-            # GSense: will be handled separately — store raw for now
-            # Shape is (frames, 2048, 4096, 1) — 12-bit effective, 4 zero LSBs
+            # GSense: shape from file is (frames, rows, cols, 1)
+            # Transpose to (rows, cols, 1, frames) for consistency
+            raw = np.transpose(raw, (1, 2, 3, 0))
+            # 12-bit effective, 4 zero LSBs
             info.raw_data = raw // 16
             bit_shift = 4
             norm_bits = 12
-            print(f"[h5_loader] GSense raw shape: {raw.shape}")
+            print(f"[h5_loader] GSense reordered: {info.raw_data.shape}  "
+                  f"(rows={info.raw_data.shape[0]}, cols={info.raw_data.shape[1]}, "
+                  f"ch={info.raw_data.shape[2]}, frames={info.raw_data.shape[3]})")
         else:
             # Unknown camera — try Foveon-style reorder as fallback
             print(f"[h5_loader] Unknown camera, attempting Foveon-style reorder")

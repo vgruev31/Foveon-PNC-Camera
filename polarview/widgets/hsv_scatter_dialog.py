@@ -7,12 +7,13 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
 from matplotlib.figure import Figure
 from matplotlib.patches import Ellipse
+from matplotlib.patheffects import Stroke, Normal
 from PyQt6.QtWidgets import QDialog, QVBoxLayout
 
-# Distinct colours for successive ROIs
+# Distinct non-black colours for successive ROIs (black reserved for mean/ellipse)
 _ROI_COLORS = [
-    "black", "red", "blue", "green", "purple",
-    "orange", "brown", "magenta", "cyan", "olive",
+    "red", "blue", "green", "purple",
+    "orange", "brown", "magenta", "cyan", "olive", "deeppink",
 ]
 
 
@@ -57,23 +58,20 @@ class HSVScatterDialog(QDialog):
         hue = hsv[:, 0]
         saturation = hsv[:, 1]
 
-        n = len(hue)
-        hsv_colours = np.stack([hue, saturation, np.ones(n)], axis=-1)
-        dot_colours = hsv_to_rgb(hsv_colours.reshape(-1, 1, 3)).reshape(-1, 3)
-
         roi_color = _ROI_COLORS[self._roi_count % len(_ROI_COLORS)]
         self._roi_count += 1
 
         ax = self._ax
 
-        # Scatter plot
+        # Scatter plot — original size, coloured per ROI
         ax.scatter(
             saturation,
             hue * 360,
-            c=dot_colours,
+            c=roi_color,
             s=30,
-            alpha=0.6,
+            alpha=0.5,
             edgecolors="none",
+            zorder=1,
         )
 
         # Mean and standard deviation
@@ -82,22 +80,32 @@ class HSVScatterDialog(QDialog):
         std_sat = float(np.std(saturation))
         std_hue = float(np.std(hue)) * 360
 
-        # Plot mean marker
+        # White halo so black markers/ellipse pop over coloured dots
+        halo = [Stroke(linewidth=4, foreground="white"), Normal()]
+
+        # Plot mean marker as 'x' in black (no label — legend uses colored circle below)
         ax.plot(
-            mean_sat, mean_hue, "+",
-            color=roi_color, markersize=14, markeredgewidth=2,
+            mean_sat, mean_hue, "x",
+            color="black", markersize=10, markeredgewidth=2,
+            zorder=10, path_effects=halo,
+        )
+
+        # Invisible scatter point for legend entry (colored circle matching ROI)
+        ax.scatter(
+            [], [], c=roi_color, s=40, edgecolors="none",
             label=f"{roi_label}: S={mean_sat:.3f}, H={mean_hue:.1f}°",
         )
 
-        # Plot 2-sigma ellipse
+        # Plot 2-sigma ellipse in black
         ellipse = Ellipse(
             (mean_sat, mean_hue),
             width=4 * std_sat,
             height=4 * std_hue,
             fill=False,
-            edgecolor=roi_color,
+            edgecolor="black",
             linewidth=2,
             linestyle="--",
+            zorder=9, path_effects=halo,
         )
         ax.add_patch(ellipse)
 

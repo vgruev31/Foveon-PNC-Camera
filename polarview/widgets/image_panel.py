@@ -51,6 +51,10 @@ class ImagePanel(QWidget):
     # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
+    def set_title(self, title: str) -> None:
+        """Change the displayed title text."""
+        self._title_label.setText(title)
+
     def set_image(self, array: np.ndarray) -> None:
         """Update the displayed image from a numpy array.
 
