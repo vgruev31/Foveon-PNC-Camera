@@ -46,7 +46,7 @@ class GsenseProcessingParams:
     lg_nir_jet: bool = False
     norm_bits: int = 12
     pixel_offset: tuple[int, int] = (0, 0)  # (row_offset, col_offset)
-    color_perm: tuple[str, str, str, str] = ('G', 'R', 'B', 'N')  # assignment for (0,0)·(0,1)·(1,0)·(1,1)
+    color_perm: tuple[str, str, str, str] = ('B', 'R', 'G', 'N')  # assignment for (0,0)·(0,1)·(1,0)·(1,1)
 
 
 def _apply_threshold_and_colormap(
@@ -123,8 +123,8 @@ def _spike_filter(channel: np.ndarray, kernel_size: int) -> np.ndarray:
     median filter and preserves non-noisy pixels exactly.
     """
     k = kernel_size
-    local_mean = uniform_filter(channel, size=k, mode="constant", cval=0.0)
-    local_sq_mean = uniform_filter(channel ** 2, size=k, mode="constant", cval=0.0)
+    local_mean = uniform_filter(channel, size=k, mode="reflect")
+    local_sq_mean = uniform_filter(channel ** 2, size=k, mode="reflect")
     local_var = np.maximum(local_sq_mean - local_mean ** 2, 0.0)
     local_std = np.sqrt(local_var)
 
@@ -162,55 +162,39 @@ def process_single_frame(
     middle_tmp = raw[::2, ::2, 1] / norm
     bottom_tmp = raw[::2, ::2, 0] / norm
 
-    # Spike removal (fast outlier replacement — runs before median)
+    # Capture per-channel normalisation range from the ORIGINAL unfiltered
+    # channels.  Filters remove bright spikes → channel max drops → if we
+    # auto-level against the post-filter max, the remaining pixels appear
+    # brighter.  Using the original range keeps intensities stable.
+    top_lo, top_hi = float(top_tmp.min()), float(top_tmp.max())
+    middle_lo, middle_hi = float(middle_tmp.min()), float(middle_tmp.max())
+    bottom_lo, bottom_hi = float(bottom_tmp.min()), float(bottom_tmp.max())
+
+    # Apply filters per channel (spike first, then median)
     if params.spike_tap > 0:
         sk = params.spike_tap
         top_tmp = _spike_filter(top_tmp, sk)
         middle_tmp = _spike_filter(middle_tmp, sk)
         bottom_tmp = _spike_filter(bottom_tmp, sk)
 
-    def _normalise(ch: np.ndarray) -> np.ndarray:
-        lo, hi = ch.min(), ch.max()
-        if hi > lo:
-            return (ch - lo) / (hi - lo)
-        return np.zeros_like(ch)
-
-    # When median filter is active, normalise first (using original range),
-    # then filter the normalised data for COLOR. This preserves the full
-    # dynamic range and avoids washed-out results.
     if params.filter_tap > 0:
         k = params.filter_tap
+        top_tmp = median_filter(top_tmp, size=(k, k), mode="reflect")
+        middle_tmp = median_filter(middle_tmp, size=(k, k), mode="reflect")
+        bottom_tmp = median_filter(bottom_tmp, size=(k, k), mode="reflect")
 
-        # Apply median filter to sub-images (for TOP/MIDDLE/BOTTOM jet images)
-        top_tmp = median_filter(top_tmp, size=(k, k), mode="constant", cval=0.0)
-        middle_tmp = median_filter(middle_tmp, size=(k, k), mode="constant", cval=0.0)
-        bottom_tmp = median_filter(bottom_tmp, size=(k, k), mode="constant", cval=0.0)
+    def _normalise_range(ch: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        if hi > lo:
+            return np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
+        return np.zeros_like(ch)
 
-        # COLOR: normalise using original range, then median filter
-        video_data.color[:, :, 0] = median_filter(
-            _normalise(raw[::2, ::2, 0] / norm),
-            size=(k, k), mode="constant", cval=0.0,
-        )
-        video_data.color[:, :, 1] = median_filter(
-            _normalise(raw[::2, ::2, 1] / norm),
-            size=(k, k), mode="constant", cval=0.0,
-        )
-        video_data.color[:, :, 2] = median_filter(
-            _normalise(raw[::2, ::2, 2] / norm),
-            size=(k, k), mode="constant", cval=0.0,
-        )
-    elif params.spike_tap > 0:
-        # Spike filter only (no median): COLOR from spike-filtered channels
-        video_data.color[:, :, 0] = _normalise(bottom_tmp)   # Red
-        video_data.color[:, :, 1] = _normalise(middle_tmp)    # Green
-        video_data.color[:, :, 2] = _normalise(top_tmp)       # Blue
-    else:
-        # No filter: COLOR from unfiltered channels
-        video_data.color[:, :, 0] = _normalise(bottom_tmp)   # Red
-        video_data.color[:, :, 1] = _normalise(middle_tmp)    # Green
-        video_data.color[:, :, 2] = _normalise(top_tmp)       # Blue
+    # Build COLOR composite using ORIGINAL per-channel ranges — applying
+    # filters before joining the channels, with intensity preserved.
+    video_data.color[:, :, 0] = _normalise_range(bottom_tmp, bottom_lo, bottom_hi)  # R
+    video_data.color[:, :, 1] = _normalise_range(middle_tmp, middle_lo, middle_hi)  # G
+    video_data.color[:, :, 2] = _normalise_range(top_tmp, top_lo, top_hi)           # B
 
-    # Threshold + jet colormap for each channel
+    # Threshold + jet colormap for each channel (uses filtered data directly)
     video_data.top[:] = _apply_threshold_and_colormap(
         top_tmp, params.top_thresh.low, params.top_thresh.high
     )
@@ -283,6 +267,20 @@ def process_gsense_frame(
     hg_r, hg_g, hg_b, hg_nir = _demosaic(hg_full)
     lg_r, lg_g, lg_b, lg_nir = _demosaic(lg_full)
 
+    # Capture per-channel normalisation range from ORIGINAL unfiltered
+    # sub-channels so filtering doesn't shift apparent intensity.
+    def _range(ch: np.ndarray) -> tuple[float, float]:
+        return float(ch.min()), float(ch.max())
+
+    hg_r_lo, hg_r_hi = _range(hg_r)
+    hg_g_lo, hg_g_hi = _range(hg_g)
+    hg_b_lo, hg_b_hi = _range(hg_b)
+    hg_nir_lo, hg_nir_hi = _range(hg_nir)
+    lg_r_lo, lg_r_hi = _range(lg_r)
+    lg_g_lo, lg_g_hi = _range(lg_g)
+    lg_b_lo, lg_b_hi = _range(lg_b)
+    lg_nir_lo, lg_nir_hi = _range(lg_nir)
+
     # Optional spike filter on individual sub-channels (runs before median)
     if params.spike_tap > 0:
         sk = params.spike_tap
@@ -298,33 +296,44 @@ def process_gsense_frame(
     # Optional median filter on individual sub-channels
     if params.filter_tap > 0:
         k = params.filter_tap
-        hg_r = median_filter(hg_r, size=(k, k), mode="constant", cval=0.0)
-        hg_g = median_filter(hg_g, size=(k, k), mode="constant", cval=0.0)
-        hg_b = median_filter(hg_b, size=(k, k), mode="constant", cval=0.0)
-        hg_nir = median_filter(hg_nir, size=(k, k), mode="constant", cval=0.0)
-        lg_r = median_filter(lg_r, size=(k, k), mode="constant", cval=0.0)
-        lg_g = median_filter(lg_g, size=(k, k), mode="constant", cval=0.0)
-        lg_b = median_filter(lg_b, size=(k, k), mode="constant", cval=0.0)
-        lg_nir = median_filter(lg_nir, size=(k, k), mode="constant", cval=0.0)
+        hg_r = median_filter(hg_r, size=(k, k), mode="reflect")
+        hg_g = median_filter(hg_g, size=(k, k), mode="reflect")
+        hg_b = median_filter(hg_b, size=(k, k), mode="reflect")
+        hg_nir = median_filter(hg_nir, size=(k, k), mode="reflect")
+        lg_r = median_filter(lg_r, size=(k, k), mode="reflect")
+        lg_g = median_filter(lg_g, size=(k, k), mode="reflect")
+        lg_b = median_filter(lg_b, size=(k, k), mode="reflect")
+        lg_nir = median_filter(lg_nir, size=(k, k), mode="reflect")
 
-    def _normalise(ch: np.ndarray) -> np.ndarray:
-        lo, hi = ch.min(), ch.max()
+    # Cache the post-filter sub-channels in their raw / 2^norm_bits scale
+    # so HDR fusion can combine HG and LG on a common physical scale.
+    video_data.hg_rgbn_filtered = np.stack([hg_r, hg_g, hg_b, hg_nir], axis=-1)
+    video_data.lg_rgbn_filtered = np.stack([lg_r, lg_g, lg_b, lg_nir], axis=-1)
+
+    def _normalise_range(ch: np.ndarray, lo: float, hi: float) -> np.ndarray:
         if hi > lo:
-            return (ch - lo) / (hi - lo)
+            return np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
         return np.zeros_like(ch)
 
-    # Build per-channel-normalised color composites [0, 1]
-    # (direct assignment — sizes may vary with pixel offset)
+    # Build per-channel-normalised color composites [0, 1] using the
+    # ORIGINAL per-channel ranges (filters applied per channel before
+    # joining, with intensity preserved).
     video_data.hg_color_raw = np.stack(
-        [_normalise(hg_r), _normalise(hg_g), _normalise(hg_b)], axis=-1
+        [_normalise_range(hg_r, hg_r_lo, hg_r_hi),
+         _normalise_range(hg_g, hg_g_lo, hg_g_hi),
+         _normalise_range(hg_b, hg_b_lo, hg_b_hi)],
+        axis=-1,
     )
     video_data.lg_color_raw = np.stack(
-        [_normalise(lg_r), _normalise(lg_g), _normalise(lg_b)], axis=-1
+        [_normalise_range(lg_r, lg_r_lo, lg_r_hi),
+         _normalise_range(lg_g, lg_g_lo, lg_g_hi),
+         _normalise_range(lg_b, lg_b_lo, lg_b_hi)],
+        axis=-1,
     )
 
-    # NIR raw (single channel, normalised to [0, 1])
-    video_data.hg_nir_raw = _normalise(hg_nir)
-    video_data.lg_nir_raw = _normalise(lg_nir)
+    # NIR raw (single channel, normalised to [0, 1] using original range)
+    video_data.hg_nir_raw = _normalise_range(hg_nir, hg_nir_lo, hg_nir_hi)
+    video_data.lg_nir_raw = _normalise_range(lg_nir, lg_nir_lo, lg_nir_hi)
 
     # Apply threshold + colormap to NIR channels → [0, 255]
     apply_hg_nir = _apply_threshold_and_colormap if params.hg_nir_jet else _apply_threshold_grayscale
@@ -336,3 +345,72 @@ def process_gsense_frame(
     video_data.lg_nir = apply_lg_nir(
         video_data.lg_nir_raw, params.lg_nir_thresh.low, params.lg_nir_thresh.high
     )
+
+
+def hdr_fuse(
+    hg: np.ndarray, lg: np.ndarray, sat_thresh: float = 0.95
+) -> np.ndarray:
+    """Fuse a HG and LG channel into one extended-dynamic-range array.
+
+    Where ``hg < sat_thresh`` (HG is unsaturated), the HG value is used.
+    Where HG is saturated, ``lg`` scaled by an estimated per-channel gain
+    ratio is used instead.  Both inputs must already be in the same
+    physical scale (raw / 2^norm_bits).
+    """
+    mask = (hg < sat_thresh) & (lg > 5e-3)
+    if int(mask.sum()) > 100:
+        ratio = float(np.median(hg[mask] / lg[mask]))
+    else:
+        ratio = 1.0
+    fused = hg.copy()
+    saturated = hg >= sat_thresh
+    fused[saturated] = lg[saturated] * ratio
+    return fused
+
+
+def compute_hdr_displays(
+    video_data: VideoData, jet_nir: bool = False, sat_thresh: float = 0.95
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build display-ready HDR Color and HDR NIR images from HG+LG fusion.
+
+    Both outputs are float64 RGB ``(H, W, 3)`` arrays in [0, 255].  Color
+    uses per-channel auto-levelling so each fused channel fills its own
+    range; NIR uses a global auto-level then either grayscale or jet
+    colormap depending on ``jet_nir``.
+    """
+    hg = video_data.hg_rgbn_filtered
+    lg = video_data.lg_rgbn_filtered
+    if hg is None or lg is None:
+        raise ValueError("HDR buffers not populated — call process_gsense_frame first.")
+
+    # Per-channel HDR fusion (R, G, B, NIR)
+    fused = np.empty_like(hg)
+    for c in range(4):
+        fused[..., c] = hdr_fuse(hg[..., c], lg[..., c], sat_thresh)
+
+    # Color: per-channel auto-level → [0, 1] → [0, 255]
+    color_disp = np.empty_like(fused[..., :3])
+    for c in range(3):
+        ch = fused[..., c]
+        lo, hi = float(ch.min()), float(ch.max())
+        if hi > lo:
+            color_disp[..., c] = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            color_disp[..., c] = 0.0
+    color_img = color_disp * 255.0
+
+    # NIR: auto-level then grayscale or jet
+    nir = fused[..., 3]
+    lo, hi = float(nir.min()), float(nir.max())
+    if hi > lo:
+        nir_norm = np.clip((nir - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        nir_norm = np.zeros_like(nir)
+
+    if jet_nir:
+        nir_img = apply_jet_colormap(nir_norm)
+    else:
+        gray = nir_norm * 255.0
+        nir_img = np.stack([gray, gray, gray], axis=-1)
+
+    return color_img, nir_img

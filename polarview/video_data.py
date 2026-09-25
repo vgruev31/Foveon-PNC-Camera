@@ -72,6 +72,12 @@ class VideoData:
     lg_color: np.ndarray | None = None
     lg_nir: np.ndarray | None = None
 
+    # Post-filter, pre-auto-level demosaiced channels in raw / 2^norm_bits units.
+    # Used by the HDR fusion path to combine HG and LG on a common physical scale.
+    # Shape (rows_q, cols_q, 4) — last axis is [R, G, B, NIR].
+    hg_rgbn_filtered: np.ndarray | None = None
+    lg_rgbn_filtered: np.ndarray | None = None
+
     def allocate(self, rows: int, cols: int) -> None:
         """Allocate Foveon working buffers.  Matches ``LPSP_UV_AllocateMemoryInCPU.m``.
 

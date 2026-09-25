@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import csv
 import datetime
 import json
 import os
 import shutil
-import traceback
 from itertools import permutations
 from pathlib import Path
 
 import h5py
 import numpy as np
+import openpyxl
 from PIL import Image
 from scipy.ndimage import label as ndimage_label, median_filter
 from PyQt6.QtCore import Qt
@@ -29,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QStatusBar,
     QVBoxLayout,
@@ -39,15 +39,15 @@ from .frame_processor import (
     ChannelThresholds,
     GsenseProcessingParams,
     ProcessingParams,
+    compute_hdr_displays,
     process_gsense_frame,
     process_single_frame,
 )
 from .h5_loader import load_h5
-from .image_saver import save_images
+from .image_saver import save_images, save_gsense_images, save_displayed_images
 from .video_data import CameraType, H5File, H5Info, VideoData
 from .widgets.frame_slider import FrameSlider
 from .widgets.image_panel import ImagePanel
-from .widgets.hsv_scatter_dialog import HSVScatterDialog
 from .widgets.roc_dialog import ROCDialog
 from .widgets.threshold_panel import ThresholdPanel
 
@@ -55,10 +55,51 @@ from .widgets.threshold_panel import ThresholdPanel
 # GSense demosaic configuration constants
 _GSENSE_OFFSETS = [(0, 0), (0, 1), (1, 0), (1, 1)]
 _GSENSE_OFFSET_LABELS = ["(0, 0)", "Skip 1 col", "Skip 1 row", "Skip 1 row + col"]
-# NIR is fixed at position (1,1); cycle through 6 permutations of R/G/B
-# for positions (0,0)·(0,1)·(1,0).
-_GSENSE_PERMS = [(*rgb, 'N') for rgb in permutations(('R', 'G', 'B'))]
-_GSENSE_PERM_DEFAULT_IDX = _GSENSE_PERMS.index(('G', 'R', 'B', 'N'))
+# Candidate RGBN filter patterns for (0,0)·(0,1)·(1,0)·(1,1).
+# Top 7 are the most likely; remaining follow for completeness.
+_PREFERRED_PERMS = [
+    ('B', 'R', 'G', 'N'),
+    ('N', 'R', 'G', 'B'),
+    ('B', 'R', 'N', 'G'),
+    ('N', 'R', 'B', 'G'),
+    ('G', 'R', 'B', 'N'),
+    ('G', 'R', 'N', 'B'),
+    ('G', 'N', 'R', 'B'),
+]
+_ALL_PERMS = list(permutations(('R', 'G', 'B', 'N')))
+_GSENSE_PERMS = _PREFERRED_PERMS + [p for p in _ALL_PERMS if p not in _PREFERRED_PERMS]
+_GSENSE_PERM_DEFAULT_IDX = 0
+
+
+def _extract_tissue_type(filename: str) -> str:
+    """Extract tissue type (LN or TUMOR) from filename.
+
+    Looks for '_LN_' or '_TUMOR_' in the filename. Returns 'LN', 'TUMOR',
+    or 'UNKNOWN' if neither is found.
+    """
+    upper = filename.upper()
+    if "_TUMOR_" in upper or "_TUMOR." in upper:
+        return "TUMOR"
+    if "_LN_" in upper or "_LN." in upper:
+        return "LN"
+    return "UNKNOWN"
+
+
+class HDRViewerDialog(QDialog):
+    """Floating non-modal window that shows a single HDR image."""
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.resize(640, 640)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        self._panel = ImagePanel(title)
+        layout.addWidget(self._panel)
+
+    def set_image(self, img: np.ndarray) -> None:
+        self._panel.set_image(img)
 
 
 class PolarViewMainWindow(QMainWindow):
@@ -66,7 +107,7 @@ class PolarViewMainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Foveon Perovskite Camera (PNC)")
+        self.setWindowTitle("GSense UV-Color-NIR")
         icon_path = Path(__file__).parent / "assets" / "mantis_shrimp.svg"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -78,18 +119,19 @@ class PolarViewMainWindow(QMainWindow):
         self._video_data: VideoData = VideoData()
         self._file_loaded: bool = False
         self._camera_type: CameraType = CameraType.UNKNOWN
+        self._displayed_images: dict[str, np.ndarray] = {}  # label → [0,255] arrays
+
+        # -- ROI save mode --
+        self._roi_save_mode: bool = False
 
         # -- H5 file navigation --
         self._h5_dir: Path | None = None  # directory of loaded file
         self._h5_files: list[Path] = []
         self._h5_file_index: int = -1
 
-        # -- ROI save mode --
-        self._roi_save_mode: bool = False
-
-        # -- Hold HSV data across Show All HSV calls --
-        self._held_hsv_groups: list[tuple[np.ndarray, str, str, int]] = []
-        self._held_hsv_dlg: QDialog | None = None
+        # -- HDR viewer dialogs (lazily created on first Show HDR click) --
+        self._hdr_color_dialog: HDRViewerDialog | None = None
+        self._hdr_nir_dialog: HDRViewerDialog | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -184,21 +226,10 @@ class PolarViewMainWindow(QMainWindow):
         self._rename_descriptor = QComboBox()
         self._rename_descriptor.addItems(["COLOR", "COLOR_NIR", "NIR", "UV"])
         rename_row.addWidget(self._rename_descriptor)
-        self._cancerous_cb = QCheckBox("Cancerous Tissue")
-        rename_row.addWidget(self._cancerous_cb)
         self._rename_btn = QPushButton("Rename H5 File")
         self._rename_btn.setEnabled(False)
         rename_row.addWidget(self._rename_btn)
         rename_row.addStretch()
-        rename_row.addWidget(QLabel("ROI:"))
-        self._roi_spin = QSpinBox()
-        self._roi_spin.setRange(1, 99)
-        self._roi_spin.setValue(1)
-        self._roi_spin.setFixedWidth(50)
-        rename_row.addWidget(self._roi_spin)
-        self._show_hsv_btn = QPushButton("Show HSV")
-        self._show_hsv_btn.setEnabled(False)
-        rename_row.addWidget(self._show_hsv_btn)
         main_layout.addLayout(rename_row)
 
         # --- Row 1d: Save buttons (left) + Show All HSV (right) ---
@@ -211,19 +242,31 @@ class PolarViewMainWindow(QMainWindow):
         self._save_uv_btn = QPushButton("Save UV Images")
         self._save_uv_btn.setEnabled(False)
         save_row.addWidget(self._save_uv_btn)
+        self._show_hdr_btn = QPushButton("Show HDR Views")
+        self._show_hdr_btn.setEnabled(False)
+        self._show_hdr_btn.setToolTip(
+            "Open two windows showing HG+LG HDR-fused Color and NIR images."
+        )
+        save_row.addWidget(self._show_hdr_btn)
         save_row.addStretch()
-        self._hold_hsv_cb = QCheckBox("Hold Data")
-        self._hold_hsv_cb.setChecked(False)
-        save_row.addWidget(self._hold_hsv_cb)
-        self._hsv_tissue_combo = QComboBox()
-        self._hsv_tissue_combo.addItems([
-            "ALL", "TUMOR", "LN",
-            "ALL LN", "Pos LN", "Neg LN",
-        ])
-        save_row.addWidget(self._hsv_tissue_combo)
-        self._show_all_hsv_btn = QPushButton("Show All HSV")
-        self._show_all_hsv_btn.setEnabled(False)
-        save_row.addWidget(self._show_all_hsv_btn)
+        # --- Right-aligned video controls ---
+        save_row.addWidget(QLabel("FPS:"))
+        self._video_fps_combo = QComboBox()
+        self._video_fps_combo.addItems(["10", "15", "24", "25", "30", "60"])
+        self._video_fps_combo.setCurrentText("25")
+        self._video_fps_combo.setToolTip("Frame rate for the saved video.")
+        save_row.addWidget(self._video_fps_combo)
+        self._save_video_btn = QPushButton("Save Video")
+        self._save_video_btn.setEnabled(False)
+        save_row.addWidget(self._save_video_btn)
+        self._save_video_composite_cb = QCheckBox("Saving Video Composite")
+        self._save_video_composite_cb.setChecked(True)
+        self._save_video_composite_cb.setToolTip(
+            "When checked, the NIR-on-Color composite is included as a "
+            "third panel in the saved video; otherwise only HG Color and "
+            "HG NIR/UV are saved."
+        )
+        save_row.addWidget(self._save_video_composite_cb)
         main_layout.addLayout(save_row)
 
         # --- Row 1e: ROI + ROC buttons ---
@@ -240,6 +283,14 @@ class PolarViewMainWindow(QMainWindow):
         self._roc_btn = QPushButton("Compute ROC")
         self._roc_btn.setEnabled(False)
         roc_row.addWidget(self._roc_btn)
+        self._roc_mode_combo = QComboBox()
+        self._roc_mode_combo.addItems([
+            "Empirical", "Linear", "Smooth (Spline)", "Smooth (KDE)",
+            "LOWESS", "Savitzky-Golay", "Bootstrap Average", "Bezier",
+            "Leave-One-Out",
+        ])
+        self._roc_mode_combo.setCurrentIndex(1)  # default to Linear
+        roc_row.addWidget(self._roc_mode_combo)
         roc_row.addStretch()
         main_layout.addLayout(roc_row)
 
@@ -280,12 +331,20 @@ class PolarViewMainWindow(QMainWindow):
         self._middle_panel = ImagePanel("MIDDLE")
         self._bottom_panel = ImagePanel("BOTTOM (NIR)")
         self._color_panel = ImagePanel("COLOR")
+        self._overlay_panel = ImagePanel("HG Color+NIR")
 
         image_row.addWidget(self._top_panel)
         image_row.addWidget(self._middle_panel)
         image_row.addWidget(self._bottom_panel)
         image_row.addWidget(self._color_panel)
+        image_row.addWidget(self._overlay_panel)
         main_layout.addLayout(image_row, stretch=1)
+
+        # --- Tissue status label (between images and thresholds) ---
+        self._tissue_label = QLabel("")
+        self._tissue_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tissue_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        main_layout.addWidget(self._tissue_label)
 
         # --- Row 3b: Jet colormap checkboxes for NIR panels (GSense only, hidden by default) ---
         self._jet_row_widget = QWidget()
@@ -297,6 +356,24 @@ class PolarViewMainWindow(QMainWindow):
         jet_row.addWidget(QLabel(""), stretch=1)  # spacer under LG Color
         self._lg_nir_jet_cb = QCheckBox("Jet Colormap")
         jet_row.addWidget(self._lg_nir_jet_cb, stretch=1)  # under LG NIR
+
+        # Transparency slider for the 5th panel (HG Color + NIR overlay).
+        # Slider value is "NIR transparency %" (0 = solid NIR, 100 = invisible).
+        overlay_alpha_widget = QWidget()
+        overlay_alpha_row = QHBoxLayout(overlay_alpha_widget)
+        overlay_alpha_row.setContentsMargins(0, 0, 0, 0)
+        overlay_alpha_row.setSpacing(4)
+        overlay_alpha_row.addWidget(QLabel("NIR Transp:"))
+        self._overlay_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self._overlay_alpha_slider.setRange(0, 100)
+        self._overlay_alpha_slider.setValue(35)  # default 35% transp → α=0.65
+        self._overlay_alpha_slider.setFixedHeight(16)
+        overlay_alpha_row.addWidget(self._overlay_alpha_slider, stretch=1)
+        self._overlay_alpha_label = QLabel("35%")
+        self._overlay_alpha_label.setFixedWidth(36)
+        overlay_alpha_row.addWidget(self._overlay_alpha_label)
+        jet_row.addWidget(overlay_alpha_widget, stretch=1)  # under HG Color+NIR
+
         self._jet_row_widget.hide()
         main_layout.addWidget(self._jet_row_widget)
 
@@ -311,6 +388,10 @@ class PolarViewMainWindow(QMainWindow):
         for w in (self._top_thresh, self._middle_thresh,
                   self._bottom_thresh, self._color_thresh):
             controls_row.addWidget(w, stretch=1)
+        # Spacer column under the 5th image panel (overlay) to keep
+        # threshold-row column widths aligned with the image row.
+        self._controls_spacer = QWidget()
+        controls_row.addWidget(self._controls_spacer, stretch=1)
 
         main_layout.addLayout(controls_row)
 
@@ -331,11 +412,14 @@ class PolarViewMainWindow(QMainWindow):
         self._min_pixels_spin.valueChanged.connect(self._on_filter_changed)
         self._delete_btn.clicked.connect(self._on_delete_file)
         self._rename_btn.clicked.connect(self._on_rename_file)
-        self._save_all_btn.clicked.connect(self._on_save_all_images)
-        self._save_uv_btn.clicked.connect(self._on_save_uv_images)
-        self._roc_btn.clicked.connect(self._on_compute_roc)
         self._create_roi_btn.clicked.connect(self._on_create_roi)
         self._clear_roi_btn.clicked.connect(self._on_clear_roi)
+        self._middle_panel.roi_selected.connect(self._on_roi_selected)
+        self._save_all_btn.clicked.connect(self._on_save_all_images)
+        self._save_uv_btn.clicked.connect(self._on_save_uv_images)
+        self._save_video_btn.clicked.connect(self._on_save_video)
+        self._show_hdr_btn.clicked.connect(self._on_show_hdr_views)
+        self._roc_btn.clicked.connect(self._on_compute_roc)
         self._scrub_browse_btn.clicked.connect(self._on_scrub_browse)
         self._scrub_btn.clicked.connect(self._on_scrub_files)
         self._frame_slider.frame_changed.connect(self._on_frame_changed)
@@ -347,13 +431,9 @@ class PolarViewMainWindow(QMainWindow):
         self._filter_combo.currentIndexChanged.connect(self._on_median_changed)
         self._spike_combo.currentIndexChanged.connect(self._on_spike_changed)
         self._save_btn.clicked.connect(self._on_save)
-        self._rename_tissue.currentTextChanged.connect(self._on_tissue_changed)
-        self._show_hsv_btn.clicked.connect(self._on_show_hsv)
-        self._hold_hsv_cb.stateChanged.connect(self._on_hold_hsv_changed)
-        self._show_all_hsv_btn.clicked.connect(self._on_show_all_hsv)
-        self._top_panel.roi_selected.connect(self._on_top_roi_selected)
         self._hg_nir_jet_cb.stateChanged.connect(self._on_jet_changed)
         self._lg_nir_jet_cb.stateChanged.connect(self._on_jet_changed)
+        self._overlay_alpha_slider.valueChanged.connect(self._on_overlay_alpha_changed)
         self._offset_combo.currentIndexChanged.connect(self._on_gsense_config_changed)
         self._perm_combo.currentIndexChanged.connect(self._on_gsense_config_changed)
         self._perm_prev_btn.clicked.connect(self._on_perm_prev)
@@ -527,53 +607,33 @@ class PolarViewMainWindow(QMainWindow):
             QMessageBox.critical(self, "Copy Failed", str(exc))
             return
 
-        # Copy ROI sidecar if it exists
-        old_roi = old_path.with_suffix(".roi.json")
-        if old_roi.exists():
-            new_roi = new_path.with_suffix(".roi.json")
-            try:
-                shutil.copy2(old_roi, new_roi)
-            except Exception:
-                pass  # non-critical
-
-        # Write CSV entry only for UV descriptor
-        if descriptor == "UV":
-            cancerous = 1 if self._cancerous_cb.isChecked() else 0
-            csv_path = dest_dir / "tissue_log.csv"
-            write_header = not csv_path.exists()
-            try:
-                with open(csv_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    if write_header:
-                        writer.writerow(["filename", "tissue_type", "cancerous"])
-                    writer.writerow([new_name, tissue, cancerous])
-            except Exception as exc:
-                QMessageBox.warning(self, "CSV Write Failed", str(exc))
-
         self.statusBar().showMessage(
             f"Copied: {old_path.name} → {dest_dir / new_name}"
         )
 
-    def _on_tissue_changed(self, tissue: str) -> None:
-        self._cancerous_cb.setChecked(tissue == "TUMOR")
-
     @staticmethod
     def _scrub_time_info(file_path: Path) -> None:
-        """Remove time-related metadata from an H5 file and reset its timestamp.
+        """Remove time-related and identifying metadata from an H5 file.
 
-        Mirrors MATLAB ``RemoveMetaData.m``:
-        - Deletes ``/camera/timestamp`` dataset (per-frame timing)
-        - Deletes ``time-info`` attribute on the root ``/`` group
+        - Deletes ``/camera/timestamp`` dataset (per-frame UTC timestamps)
+        - Deletes root attributes: ``time-info``, ``network-info``,
+          ``os-info``, ``hardware-info``, ``python-info``
+        - Deletes ``/camera`` attribute ``fw-build-time``
         - Sets the file's modification time to January 1, 2000
         """
         with h5py.File(file_path, "a") as f:
             # Remove /camera/timestamp dataset
             if "camera" in f and "timestamp" in f["camera"]:
                 del f["camera"]["timestamp"]
-            # Remove root 'time-info' attribute
+            # Remove time/identifying root attributes
             root = f["/"]
-            if "time-info" in root.attrs:
-                del root.attrs["time-info"]
+            for attr in ("time-info", "network-info", "os-info",
+                         "hardware-info", "python-info"):
+                if attr in root.attrs:
+                    del root.attrs[attr]
+            # Remove fw-build-time from /camera group
+            if "camera" in f and "fw-build-time" in f["camera"].attrs:
+                del f["camera"].attrs["fw-build-time"]
 
         # Set file system timestamp to Jan 1, 2000 00:00:00
         epoch_2000 = datetime.datetime(2000, 1, 1).timestamp()
@@ -649,14 +709,17 @@ class PolarViewMainWindow(QMainWindow):
         self._delete_btn.setEnabled(self._file_loaded)
         self._rename_btn.setEnabled(self._file_loaded)
         is_foveon = self._camera_type != CameraType.GSENSE
-        self._save_all_btn.setEnabled(self._file_loaded and is_foveon)
-        self._save_uv_btn.setEnabled(self._file_loaded and is_foveon)
-        self._roc_btn.setEnabled(self._file_loaded and is_foveon)
-        self._create_roi_btn.setEnabled(self._file_loaded and is_foveon)
-        self._clear_roi_btn.setEnabled(self._file_loaded and is_foveon)
-        self._show_hsv_btn.setEnabled(self._file_loaded and is_foveon)
-        self._show_all_hsv_btn.setEnabled(self._file_loaded and is_foveon)
-        self._roi_spin.setEnabled(self._file_loaded and is_foveon)
+        self._save_all_btn.setEnabled(self._file_loaded)
+        self._save_uv_btn.setEnabled(self._file_loaded)
+        self._save_video_btn.setEnabled(
+            self._file_loaded and self._camera_type == CameraType.GSENSE
+        )
+        self._show_hdr_btn.setEnabled(
+            self._file_loaded and self._camera_type == CameraType.GSENSE
+        )
+        self._roc_btn.setEnabled(self._file_loaded)
+        self._create_roi_btn.setEnabled(self._file_loaded)
+        self._clear_roi_btn.setEnabled(self._file_loaded)
 
     def _load_file(self, p: Path) -> None:
         self.statusBar().showMessage(f"Loading {p}...")
@@ -704,8 +767,9 @@ class PolarViewMainWindow(QMainWindow):
 
             self._process_and_display()
             self._update_roi_status()
+            self._update_tissue_status(p)
         except Exception as exc:
-            traceback.print_exc()
+
             QMessageBox.critical(self, "Load Failed", f"{p.name}: {exc}")
             self.statusBar().showMessage("Load failed")
 
@@ -743,7 +807,12 @@ class PolarViewMainWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            saved = save_images(self._video_data, self._h5file)
+            if self._displayed_images:
+                saved = save_displayed_images(self._displayed_images, self._h5file)
+            elif self._camera_type == CameraType.GSENSE:
+                saved = save_gsense_images(self._video_data, self._h5file)
+            else:
+                saved = save_images(self._video_data, self._h5file)
             QMessageBox.information(
                 self,
                 "Saved",
@@ -756,7 +825,7 @@ class PolarViewMainWindow(QMainWindow):
             self.statusBar().showMessage("Save failed")
 
     def _on_save_all_images(self) -> None:
-        """Process every H5 file in the current directory and save all 4 images."""
+        """Process every H5 file in the current directory and save all images."""
         if not self._file_loaded or not self._h5_files:
             QMessageBox.warning(self, "No File", "No file loaded.")
             return
@@ -765,9 +834,6 @@ class PolarViewMainWindow(QMainWindow):
         all_h5 = sorted(h5_dir.glob("*.h5"))
         if not all_h5:
             return
-
-        params = self._get_processing_params()
-        params.frame_number = 0
 
         saved_total = 0
         errors = []
@@ -779,20 +845,60 @@ class PolarViewMainWindow(QMainWindow):
             try:
                 info = load_h5(fp)
                 vd = VideoData()
-                vd.allocate(info.attr.rows, info.attr.columns)
-                p = ProcessingParams(
-                    frame_number=0,
-                    filter_tap=params.filter_tap,
-                    spike_tap=params.spike_tap,
-                    top_thresh=params.top_thresh,
-                    middle_thresh=params.middle_thresh,
-                    bottom_thresh=params.bottom_thresh,
-                    is_uv="UV" in fp.stem,
-                    norm_bits=info.attr.norm_bits,
-                )
-                process_single_frame(info, vd, p)
                 h5f = H5File(name=fp.stem, path=str(fp.parent))
-                saved = save_images(vd, h5f)
+
+                if info.attr.camera_type == CameraType.GSENSE:
+                    vd.allocate_gsense(info.attr.rows, info.attr.columns)
+                    gp = GsenseProcessingParams(
+                        frame_number=0,
+                        filter_tap=self._get_filter_tap(),
+                        spike_tap=self._get_spike_tap(),
+                        hg_nir_thresh=ChannelThresholds(
+                            self._middle_thresh.low, self._middle_thresh.high),
+                        lg_nir_thresh=ChannelThresholds(
+                            self._color_thresh.low, self._color_thresh.high),
+                        hg_nir_jet=self._hg_nir_jet_cb.isChecked(),
+                        lg_nir_jet=self._lg_nir_jet_cb.isChecked(),
+                        norm_bits=info.attr.norm_bits,
+                        pixel_offset=_GSENSE_OFFSETS[self._offset_combo.currentIndex()],
+                        color_perm=_GSENSE_PERMS[self._perm_combo.currentIndex()],
+                    )
+                    process_gsense_frame(info, vd, gp)
+                    display_imgs = {
+                        "HG Color": self._apply_color_threshold(
+                            vd.hg_color_raw, self._top_thresh.low, self._top_thresh.high),
+                        "HG NIR": vd.hg_nir,
+                        "LG Color": self._apply_color_threshold(
+                            vd.lg_color_raw, self._bottom_thresh.low, self._bottom_thresh.high),
+                        "LG NIR": vd.lg_nir,
+                    }
+                    saved = save_displayed_images(display_imgs, h5f)
+                else:
+                    vd.allocate(info.attr.rows, info.attr.columns)
+                    p = ProcessingParams(
+                        frame_number=0,
+                        filter_tap=self._get_filter_tap(),
+                        spike_tap=self._get_spike_tap(),
+                        top_thresh=ChannelThresholds(
+                            self._top_thresh.low, self._top_thresh.high),
+                        middle_thresh=ChannelThresholds(
+                            self._middle_thresh.low, self._middle_thresh.high),
+                        bottom_thresh=ChannelThresholds(
+                            self._bottom_thresh.low, self._bottom_thresh.high),
+                        is_uv="UV" in fp.stem,
+                        norm_bits=info.attr.norm_bits,
+                    )
+                    process_single_frame(info, vd, p)
+                    color_img = self._apply_color_threshold(
+                        vd.color, self._color_thresh.low, self._color_thresh.high)
+                    display_imgs = {
+                        "TOP Image": vd.top,
+                        "MIDDLE Image": vd.middle,
+                        "BOTTOM Image": vd.bottom,
+                        "COLOR Image": color_img,
+                    }
+                    saved = save_displayed_images(display_imgs, h5f)
+
                 saved_total += len(saved)
             except Exception as exc:
                 errors.append(f"{fp.name}: {exc}")
@@ -804,7 +910,7 @@ class PolarViewMainWindow(QMainWindow):
         self.statusBar().showMessage(f"Save ALL complete: {saved_total} images")
 
     def _on_save_uv_images(self) -> None:
-        """Process every UV H5 file in the current directory and save the TOP and COLOR images."""
+        """Process every UV H5 file in the current directory and save images."""
         if not self._file_loaded or not self._h5_files:
             QMessageBox.warning(self, "No File", "No file loaded.")
             return
@@ -818,8 +924,6 @@ class PolarViewMainWindow(QMainWindow):
         output_dir = h5_dir / "Processed UV Images"
         output_dir.mkdir(exist_ok=True)
 
-        params = self._get_processing_params()
-
         saved_count = 0
         errors = []
         for i, fp in enumerate(all_h5):
@@ -830,38 +934,59 @@ class PolarViewMainWindow(QMainWindow):
             try:
                 info = load_h5(fp)
                 vd = VideoData()
-                vd.allocate(info.attr.rows, info.attr.columns)
-                p = ProcessingParams(
-                    frame_number=0,
-                    filter_tap=params.filter_tap,
-                    spike_tap=params.spike_tap,
-                    top_thresh=params.top_thresh,
-                    middle_thresh=params.middle_thresh,
-                    bottom_thresh=params.bottom_thresh,
-                    is_uv=True,
-                    norm_bits=info.attr.norm_bits,
-                )
-                process_single_frame(info, vd, p)
+                h5f = H5File(name=fp.stem, path=str(output_dir))
 
-                # Save TOP image (already [0, 255] from jet colormap)
-                top_img = np.clip(vd.top, 0.0, 255.0).astype(np.uint8)
-                top_path = output_dir / f"{fp.stem} TOP Image.png"
-                Image.fromarray(top_img, mode="RGB").save(str(top_path))
-
-                # Save COLOR image with threshold clamping (same as display)
-                color_low = self._color_thresh.low / 100.0
-                color_high = self._color_thresh.high / 100.0
-                color_img = vd.color.copy()
-                color_img[color_img < color_low] = 0.0
-                color_img[color_img > color_high] = 1.0
-                denom = color_high - color_low
-                if denom > 0:
-                    color_img = (color_img - color_low) / denom
+                if info.attr.camera_type == CameraType.GSENSE:
+                    vd.allocate_gsense(info.attr.rows, info.attr.columns)
+                    gp = GsenseProcessingParams(
+                        frame_number=0,
+                        filter_tap=self._get_filter_tap(),
+                        spike_tap=self._get_spike_tap(),
+                        hg_nir_thresh=ChannelThresholds(
+                            self._middle_thresh.low, self._middle_thresh.high),
+                        lg_nir_thresh=ChannelThresholds(
+                            self._color_thresh.low, self._color_thresh.high),
+                        hg_nir_jet=self._hg_nir_jet_cb.isChecked(),
+                        lg_nir_jet=self._lg_nir_jet_cb.isChecked(),
+                        norm_bits=info.attr.norm_bits,
+                        pixel_offset=_GSENSE_OFFSETS[self._offset_combo.currentIndex()],
+                        color_perm=_GSENSE_PERMS[self._perm_combo.currentIndex()],
+                    )
+                    process_gsense_frame(info, vd, gp)
+                    display_imgs = {
+                        "HG Color": self._apply_color_threshold(
+                            vd.hg_color_raw, self._top_thresh.low, self._top_thresh.high),
+                        "HG NIR": vd.hg_nir,
+                        "LG Color": self._apply_color_threshold(
+                            vd.lg_color_raw, self._bottom_thresh.low, self._bottom_thresh.high),
+                        "LG NIR": vd.lg_nir,
+                    }
+                    save_displayed_images(display_imgs, h5f)
                 else:
-                    color_img = np.zeros_like(color_img)
-                color_img = (np.clip(color_img, 0.0, 1.0) * 255.0).astype(np.uint8)
-                color_path = output_dir / f"{fp.stem} COLOR Image.png"
-                Image.fromarray(color_img, mode="RGB").save(str(color_path))
+                    vd.allocate(info.attr.rows, info.attr.columns)
+                    p = ProcessingParams(
+                        frame_number=0,
+                        filter_tap=self._get_filter_tap(),
+                        spike_tap=self._get_spike_tap(),
+                        top_thresh=ChannelThresholds(
+                            self._top_thresh.low, self._top_thresh.high),
+                        middle_thresh=ChannelThresholds(
+                            self._middle_thresh.low, self._middle_thresh.high),
+                        bottom_thresh=ChannelThresholds(
+                            self._bottom_thresh.low, self._bottom_thresh.high),
+                        is_uv=True,
+                        norm_bits=info.attr.norm_bits,
+                    )
+                    process_single_frame(info, vd, p)
+                    color_img = self._apply_color_threshold(
+                        vd.color, self._color_thresh.low, self._color_thresh.high)
+                    display_imgs = {
+                        "TOP Image": vd.top,
+                        "MIDDLE Image": vd.middle,
+                        "BOTTOM Image": vd.bottom,
+                        "COLOR Image": color_img,
+                    }
+                    save_displayed_images(display_imgs, h5f)
 
                 saved_count += 1
             except Exception as exc:
@@ -872,6 +997,130 @@ class PolarViewMainWindow(QMainWindow):
             msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
         QMessageBox.information(self, "Save UV Complete", msg)
         self.statusBar().showMessage(f"Save UV complete: {saved_count} images")
+
+    def _on_save_video(self) -> None:
+        """Write an MP4 of the per-frame HG panes for the current file.
+
+        Always includes ``HG Color | HG NIR/UV``.  When the
+        "Saving Video Composite" checkbox is checked, a third panel —
+        the NIR-on-Color overlay (using the current transparency slider) —
+        is appended.  Frame rate comes from the FPS selector.  The video
+        is saved one directory above the current H5 file as
+        ``<h5_stem>.mp4``.  GSense only.
+        """
+        if not self._file_loaded or self._h5_file_index < 0:
+            QMessageBox.warning(self, "No File", "No file loaded.")
+            return
+        if self._camera_type != CameraType.GSENSE:
+            QMessageBox.warning(
+                self, "GSense Only",
+                "Save Video supports GSense files only (HG Color + HG NIR/UV).",
+            )
+            return
+
+        try:
+            import imageio.v2 as iio
+        except ImportError as exc:
+            QMessageBox.critical(
+                self, "Missing Dependency",
+                f"imageio is required for Save Video.\n{exc}",
+            )
+            return
+
+        h5_path = self._h5_files[self._h5_file_index]
+        out_dir = h5_path.parent.parent
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{h5_path.stem}.mp4"
+
+        n_frames = self._h5info.attr.num_frames
+        offset = _GSENSE_OFFSETS[self._offset_combo.currentIndex()]
+        perm = _GSENSE_PERMS[self._perm_combo.currentIndex()]
+        include_overlay = self._save_video_composite_cb.isChecked()
+        overlay_alpha = self._overlay_alpha()
+        try:
+            fps = int(self._video_fps_combo.currentText())
+        except ValueError:
+            fps = 25
+
+        # Use a transient VideoData buffer so we don't disturb the on-screen
+        # display while iterating frames.
+        vd = VideoData()
+        vd.allocate_gsense(self._h5info.attr.rows, self._h5info.attr.columns)
+
+        writer = None
+        try:
+            for f_idx in range(n_frames):
+                if f_idx % 5 == 0:
+                    self.statusBar().showMessage(
+                        f"Rendering video: frame {f_idx + 1}/{n_frames}"
+                    )
+                    QApplication.processEvents()
+
+                gp = GsenseProcessingParams(
+                    frame_number=f_idx,
+                    filter_tap=self._get_filter_tap(),
+                    spike_tap=self._get_spike_tap(),
+                    hg_nir_thresh=ChannelThresholds(
+                        self._middle_thresh.low, self._middle_thresh.high),
+                    lg_nir_thresh=ChannelThresholds(
+                        self._color_thresh.low, self._color_thresh.high),
+                    hg_nir_jet=self._hg_nir_jet_cb.isChecked(),
+                    lg_nir_jet=self._lg_nir_jet_cb.isChecked(),
+                    norm_bits=self._h5info.attr.norm_bits,
+                    pixel_offset=offset,
+                    color_perm=perm,
+                )
+                process_gsense_frame(self._h5info, vd, gp)
+
+                hg_color = self._apply_color_threshold(
+                    vd.hg_color_raw, self._top_thresh.low, self._top_thresh.high)
+                hg_nir = vd.hg_nir
+
+                panes = [hg_color, hg_nir]
+                if include_overlay:
+                    overlay = self._build_nir_color_overlay(
+                        hg_color, hg_nir, vd.hg_nir_raw,
+                        self._middle_thresh.low, self._middle_thresh.high,
+                        overlay_alpha,
+                    )
+                    panes.append(overlay)
+
+                combined = np.concatenate(panes, axis=1)
+                frame_u8 = np.clip(combined, 0.0, 255.0).astype(np.uint8)
+
+                # H.264 (libx264) requires even width & height; pad if needed.
+                h, w = frame_u8.shape[:2]
+                if h % 2 or w % 2:
+                    pad_h = h % 2
+                    pad_w = w % 2
+                    frame_u8 = np.pad(
+                        frame_u8,
+                        ((0, pad_h), (0, pad_w), (0, 0)),
+                        mode="edge",
+                    )
+
+                if writer is None:
+                    writer = iio.get_writer(
+                        str(out_path), fps=fps, codec="libx264",
+                        quality=8, macro_block_size=1,
+                    )
+                writer.append_data(frame_u8)
+        except Exception as exc:
+            if writer is not None:
+                writer.close()
+            QMessageBox.critical(self, "Save Video Failed", str(exc))
+            self.statusBar().showMessage("Save Video failed")
+            return
+        finally:
+            if writer is not None:
+                writer.close()
+
+        self.statusBar().showMessage(f"Video saved: {out_path}")
+        n_panes = 3 if include_overlay else 2
+        QMessageBox.information(
+            self, "Video Saved",
+            f"Saved {n_frames} frames ({n_panes} panes) at {fps} fps to:\n{out_path}",
+        )
 
     @staticmethod
     def _classify_at_threshold(
@@ -900,8 +1149,61 @@ class PolarViewMainWindow(QMainWindow):
                 return True
         return False
 
+    def _extract_nir_channel(self, info: H5Info, frame: int = 0) -> np.ndarray:
+        """Extract the HG NIR channel from an H5Info, applying current demosaic settings.
+
+        Returns a 2-D float64 array normalised to [0, 1].
+        """
+        from polarview.frame_processor import _spike_filter
+
+        frame = min(frame, info.attr.num_frames - 1)
+        raw_frame = info.raw_data[:, :, 0, frame].astype(np.float64)
+        norm = 2 ** info.attr.norm_bits
+        cols_half = raw_frame.shape[1] // 2
+        hg_full = raw_frame[:, :cols_half] / norm
+
+        offset = _GSENSE_OFFSETS[self._offset_combo.currentIndex()]
+        perm = _GSENSE_PERMS[self._perm_combo.currentIndex()]
+        offset_y, offset_x = offset
+
+        # Step 1: subsample by 2
+        subsampled = hg_full[offset_y::2, offset_x::2]
+        rows_s = (subsampled.shape[0] // 2) * 2
+        cols_s = (subsampled.shape[1] // 2) * 2
+        subsampled = subsampled[:rows_s, :cols_s]
+
+        # Step 2: demosaic — extract NIR position
+        positions = [
+            subsampled[0::2, 0::2],
+            subsampled[0::2, 1::2],
+            subsampled[1::2, 0::2],
+            subsampled[1::2, 1::2],
+        ]
+        ch = dict(zip(perm, positions))
+        nir = ch['N']
+
+        # Apply filters
+        roc_spike_tap = self._get_spike_tap()
+        roc_median_tap = self._get_filter_tap()
+        if roc_spike_tap > 0:
+            nir = _spike_filter(nir, roc_spike_tap)
+        if roc_median_tap > 0:
+            nir = median_filter(nir, size=(roc_median_tap, roc_median_tap),
+                                mode="reflect")
+
+        # Normalise to [0, 1]
+        lo, hi = nir.min(), nir.max()
+        if hi > lo:
+            nir = (nir - lo) / (hi - lo)
+        else:
+            nir = np.zeros_like(nir)
+        return nir
+
     def _on_compute_roc(self) -> None:
-        """Compute and display an ROC curve for UV images using tissue_log.csv.
+        """Compute and display an ROC curve using tissue_log.csv.
+
+        For Foveon: operates on the TOP (UV) channel.
+        For GSense: operates on the HG NIR channel.
 
         For each file, uses binary search to find the maximum Lo threshold
         (0-100) at which the image is classified positive (has a contiguous
@@ -913,32 +1215,41 @@ class PolarViewMainWindow(QMainWindow):
             return
 
         h5_dir = self._h5_files[0].parent
-        csv_path = h5_dir / "tissue_log.csv"
-        if not csv_path.exists():
+        xlsx_path = h5_dir / "tissue_log.xlsx"
+        if not xlsx_path.exists():
             QMessageBox.warning(
-                self, "No tissue_log.csv",
-                f"tissue_log.csv not found in:\n{h5_dir}\n\n"
-                "Rename UV files first to generate it.",
+                self, "No tissue_log.xlsx",
+                f"tissue_log.xlsx not found in:\n{h5_dir}\n\n"
+                "Place a tissue_log.xlsx (filename, cancerous, frame) in this folder.",
             )
             return
 
-        # Read tissue_log.csv
-        entries: list[tuple[str, str, int]] = []  # (filename, tissue_type, cancerous)
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                entries.append((
-                    row["filename"].strip(),
-                    row["tissue_type"].strip(),
-                    int(row["cancerous"]),
-                ))
+        # Read tissue_log.xlsx — skip TUMOR samples since the ROC focuses on LN
+        entries: list[tuple[str, int, int]] = []  # (filename, cancerous, frame)
+        n_tumor_skipped = 0
+        wb = openpyxl.load_workbook(xlsx_path, read_only=True)
+        ws = wb.active
+        for row_idx in range(2, ws.max_row + 1):  # skip header
+            fname_val = ws.cell(row=row_idx, column=1).value
+            if fname_val is None:
+                continue
+            fname_str = str(fname_val).strip()
+            if _extract_tissue_type(fname_str) == "TUMOR":
+                n_tumor_skipped += 1
+                continue
+            cancerous_val = int(ws.cell(row=row_idx, column=2).value)
+            frame_val = int(ws.cell(row=row_idx, column=3).value or 0)
+            entries.append((fname_str, cancerous_val, frame_val))
+        wb.close()
 
         if not entries:
-            QMessageBox.warning(self, "Empty CSV", "tissue_log.csv contains no entries.")
+            QMessageBox.warning(
+                self, "Empty Log",
+                "tissue_log.xlsx contains no LN entries (TUMOR samples are skipped).",
+            )
             return
 
-        # Phase 1: Load all files — extract filtered TOP channel + ROI mask
-        # Use the same filter currently selected in the GUI
+        # Phase 1: Load all files — extract channel + ROI mask
         from polarview.frame_processor import _spike_filter
         roc_median_tap = self._get_filter_tap()
         roc_spike_tap = self._get_spike_tap()
@@ -948,10 +1259,12 @@ class PolarViewMainWindow(QMainWindow):
         elif roc_spike_tap > 0:
             filter_desc = f"Spike {roc_spike_tap}"
 
-        file_data: list[tuple] = []  # (top_filtered, roi_mask, label, fname, ttype, h5_path)
+        is_gsense = self._camera_type == CameraType.GSENSE
+
+        file_data: list[tuple] = []  # (channel, roi_mask, label, fname, fp)
         errors: list[str] = []
 
-        for i, (fname, ttype, label) in enumerate(entries):
+        for i, (fname, label, frame) in enumerate(entries):
             self.statusBar().showMessage(
                 f"Loading files ({filter_desc}): {i + 1}/{len(entries)} — {fname}"
             )
@@ -964,23 +1277,28 @@ class PolarViewMainWindow(QMainWindow):
 
             try:
                 info = load_h5(fp)
-                raw_frame = info.raw_data[:, :, :, 0].astype(np.float64)
-                norm = 2 ** info.attr.norm_bits
-                top_ch = raw_frame[::2, ::2, 2] / norm
 
-                # Apply whichever filter is selected (only one can be active)
-                if roc_spike_tap > 0:
-                    top_ch = _spike_filter(top_ch, roc_spike_tap)
-                if roc_median_tap > 0:
-                    top_ch = median_filter(
-                        top_ch, size=(roc_median_tap, roc_median_tap),
-                        mode="constant", cval=0.0,
-                    )
+                if info.attr.camera_type == CameraType.GSENSE:
+                    ch = self._extract_nir_channel(info, frame)
+                else:
+                    # Foveon: TOP channel
+                    frame_idx = min(frame, info.attr.num_frames - 1)
+                    raw_frame = info.raw_data[:, :, :, frame_idx].astype(np.float64)
+                    norm = 2 ** info.attr.norm_bits
+                    ch = raw_frame[::2, ::2, 2] / norm
+
+                    if roc_spike_tap > 0:
+                        ch = _spike_filter(ch, roc_spike_tap)
+                    if roc_median_tap > 0:
+                        ch = median_filter(
+                            ch, size=(roc_median_tap, roc_median_tap),
+                            mode="reflect",
+                        )
 
                 roi_path = fp.with_suffix(".roi.json")
-                roi_mask = self._load_roi_mask(roi_path, top_ch.shape)
+                roi_mask = self._load_roi_mask(roi_path, ch.shape)
 
-                file_data.append((top_ch, roi_mask, label, fname, ttype, fp))
+                file_data.append((ch, roi_mask, label, fname, fp))
             except Exception as exc:
                 errors.append(f"{fname}: {exc}")
 
@@ -1001,34 +1319,27 @@ class PolarViewMainWindow(QMainWindow):
             )
 
         # Phase 2: Binary search for each file's critical threshold (score)
-        # The score is the max threshold (0-100) at which the file is positive.
-        # Classification is monotonic: as threshold rises, pixels drop out,
-        # so a positive file can only become negative, never the reverse.
-        # ~15 iterations of binary search gives precision < 0.01.
         min_pixels = self._min_pixels_spin.value()
         scores = np.zeros(n_files, dtype=float)
 
-        for fi, (top_filtered, roi_mask, label, fname, ttype, fp) in enumerate(file_data):
+        for fi, (ch_filtered, roi_mask, label, fname, fp) in enumerate(file_data):
             self.statusBar().showMessage(
                 f"Computing scores (min {min_pixels} px): {fi + 1}/{n_files} — {fname}"
             )
             QApplication.processEvents()
 
-            # Check if positive at the lowest threshold (0)
-            if not self._classify_at_threshold(top_filtered, roi_mask, 0.0, min_pixels):
-                scores[fi] = -1.0  # never positive
+            if not self._classify_at_threshold(ch_filtered, roi_mask, 0.0, min_pixels):
+                scores[fi] = -1.0
                 continue
 
-            # Check if positive at the highest threshold (100)
-            if self._classify_at_threshold(top_filtered, roi_mask, 1.0, min_pixels):
+            if self._classify_at_threshold(ch_filtered, roi_mask, 1.0, min_pixels):
                 scores[fi] = 100.0
                 continue
 
-            # Binary search in [0, 100] for the crossover point
             lo, hi = 0.0, 100.0
             for _ in range(15):
                 mid = (lo + hi) / 2.0
-                if self._classify_at_threshold(top_filtered, roi_mask, mid / 100.0, min_pixels):
+                if self._classify_at_threshold(ch_filtered, roi_mask, mid / 100.0, min_pixels):
                     lo = mid
                 else:
                     hi = mid
@@ -1036,20 +1347,28 @@ class PolarViewMainWindow(QMainWindow):
 
         labels_arr = np.array([d[2] for d in file_data])
         filenames_list = [d[3] for d in file_data]
-        tissue_list = [d[4] for d in file_data]
+        tissue_list = [_extract_tissue_type(d[3]) for d in file_data]
 
         n_pos = int(labels_arr.sum())
+        skipped_msg = f", {n_tumor_skipped} TUMOR skipped" if n_tumor_skipped else ""
         self.statusBar().showMessage(
-            f"ROC computed from {n_files} files "
-            f"({n_pos} positive, {n_files - n_pos} negative)"
+            f"ROC computed from {n_files} LN files "
+            f"({n_pos} positive, {n_files - n_pos} negative{skipped_msg})"
         )
 
-        # Phase 3: Show ROC dialog
+        # Phase 3: Show ROC dialog and export results to Excel
         dlg = ROCDialog(self)
+        roc_mode = self._roc_mode_combo.currentText()
+        roc_xlsx_path = h5_dir / "roc_results.xlsx"
         optimal_thresh = dlg.plot_roc(
             labels_arr, scores, filenames_list, tissue_list,
+            mode=roc_mode, excel_path=roc_xlsx_path,
         )
         dlg.show()
+        if roc_xlsx_path.exists():
+            self.statusBar().showMessage(
+                f"ROC results saved to {roc_xlsx_path.name}"
+            )
 
         if optimal_thresh is None:
             return
@@ -1058,28 +1377,26 @@ class PolarViewMainWindow(QMainWindow):
         output_dir = h5_dir / "ROC Thresholded Images"
         output_dir.mkdir(exist_ok=True)
 
-        # Clear previous PNG files from the output directory
         for old_png in output_dir.glob("*.png"):
             old_png.unlink()
 
         thresh_val = optimal_thresh / 100.0
         saved_count = 0
 
-        for fi, (top_filtered, roi_mask, label, fname, ttype, fp) in enumerate(file_data):
+        for fi, (ch_filtered, roi_mask, label, fname, fp) in enumerate(file_data):
             self.statusBar().showMessage(
                 f"Generating thresholded images: {fi + 1}/{n_files} — {fname}"
             )
             QApplication.processEvents()
 
-            h_img, w_img = top_filtered.shape
+            h_img, w_img = ch_filtered.shape
             rgb = np.zeros((h_img, w_img, 3), dtype=np.uint8)
 
             if roi_mask is not None:
-                above = roi_mask & (top_filtered >= thresh_val)
+                above = roi_mask & (ch_filtered >= thresh_val)
             else:
-                above = top_filtered >= thresh_val
+                above = ch_filtered >= thresh_val
 
-            # Keep only contiguous regions >= min_pixels
             labeled_arr, n_comp = ndimage_label(above)
             keep = np.zeros_like(above)
             for comp_id in range(1, n_comp + 1):
@@ -1088,7 +1405,6 @@ class PolarViewMainWindow(QMainWindow):
             rgb[keep] = [255, 255, 255]
 
             if roi_mask is not None:
-                # Draw ROI boundary in green
                 roi_path = fp.with_suffix(".roi.json")
                 with open(roi_path) as fh:
                     roi_data = json.load(fh)
@@ -1115,22 +1431,21 @@ class PolarViewMainWindow(QMainWindow):
                             y0 += sy
 
             classified = 1 if scores[fi] >= optimal_thresh else 0
-
             out_path = output_dir / f"{Path(fname).stem}_GT{label}_CL{classified}.png"
             Image.fromarray(rgb, mode="RGB").save(str(out_path))
             saved_count += 1
 
-        # Free file data
         del file_data
 
+        channel_name = "HG NIR" if is_gsense else "TOP (UV)"
         self.statusBar().showMessage(
             f"ROC complete. Saved {saved_count} thresholded images to {output_dir.name}/"
         )
         QMessageBox.information(
             self, "ROC Complete",
             f"Optimal threshold: {optimal_thresh:.1f} / 100\n"
-            f"Filter: {filter_desc}\n\n"
-            f"Set the TOP Lo slider to {optimal_thresh:.1f} and check 'Mask UV Pixels'\n"
+            f"Channel: {channel_name}, Filter: {filter_desc}\n\n"
+            f"Set the NIR Lo slider to {optimal_thresh:.1f} and check 'Mask UV Pixels'\n"
             f"to see the same view on the current image.\n\n"
             f"Saved {saved_count} thresholded B&W images to:\n{output_dir}",
         )
@@ -1146,6 +1461,8 @@ class PolarViewMainWindow(QMainWindow):
         self._bottom_panel.set_title("BOTTOM (NIR)")
         self._color_panel.show()
         self._color_panel.set_title("COLOR")
+        self._overlay_panel.hide()
+        self._controls_spacer.hide()
         self._bottom_thresh.show()
         self._color_thresh.show()
         self._jet_row_widget.hide()
@@ -1156,18 +1473,20 @@ class PolarViewMainWindow(QMainWindow):
             w.setMaximumWidth(260)
 
     def _setup_gsense_ui(self) -> None:
-        """Configure panel visibility for GSense 4-panel demosaiced mode."""
+        """Configure panel visibility for GSense 5-panel mode."""
         self._top_panel.set_title("HG Color")
         self._middle_panel.set_title("HG NIR/UV")
         self._bottom_panel.show()
         self._bottom_panel.set_title("LG Color")
         self._color_panel.show()
         self._color_panel.set_title("LG NIR/UV")
+        self._overlay_panel.show()
+        self._overlay_panel.set_title("HG Color+NIR")
+        self._controls_spacer.show()
         self._bottom_thresh.show()
         self._color_thresh.show()
         self._jet_row_widget.show()
         self._gsense_config_widget.show()
-        # Restore 4-column max widths
         for w in (self._top_thresh, self._middle_thresh,
                   self._bottom_thresh, self._color_thresh):
             w.setMaximumWidth(260)
@@ -1175,6 +1494,55 @@ class PolarViewMainWindow(QMainWindow):
     def _on_jet_changed(self, _state: int) -> None:
         """Jet colormap checkbox toggled — reprocess GSense display."""
         self._process_and_display()
+
+    def _on_overlay_alpha_changed(self, value: int) -> None:
+        """Overlay transparency slider changed — re-render the overlay panel."""
+        self._overlay_alpha_label.setText(f"{value}%")
+        self._process_and_display()
+
+    def _overlay_alpha(self) -> float:
+        """Return the NIR overlay opacity (0..1) from the transparency slider."""
+        return 1.0 - self._overlay_alpha_slider.value() / 100.0
+
+    def _on_show_hdr_views(self) -> None:
+        """Open (or raise) the HDR Color and HDR NIR viewer windows."""
+        if self._camera_type != CameraType.GSENSE:
+            return
+        if self._hdr_color_dialog is None:
+            self._hdr_color_dialog = HDRViewerDialog(
+                "HDR Color (HG + LG fused)", self
+            )
+        if self._hdr_nir_dialog is None:
+            self._hdr_nir_dialog = HDRViewerDialog(
+                "HDR NIR (HG + LG fused)", self
+            )
+        self._hdr_color_dialog.show()
+        self._hdr_color_dialog.raise_()
+        self._hdr_nir_dialog.show()
+        self._hdr_nir_dialog.raise_()
+        self._update_hdr_views()
+
+    def _update_hdr_views(self) -> None:
+        """Recompute HDR images and push them to any visible HDR dialog."""
+        color_dlg = self._hdr_color_dialog
+        nir_dlg = self._hdr_nir_dialog
+        color_visible = color_dlg is not None and color_dlg.isVisible()
+        nir_visible = nir_dlg is not None and nir_dlg.isVisible()
+        if not (color_visible or nir_visible):
+            return
+        if self._video_data.hg_rgbn_filtered is None:
+            return
+        try:
+            color_img, nir_img = compute_hdr_displays(
+                self._video_data, jet_nir=self._hg_nir_jet_cb.isChecked(),
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(f"HDR error: {exc}")
+            return
+        if color_visible:
+            color_dlg.set_image(color_img)
+        if nir_visible:
+            nir_dlg.set_image(nir_img)
 
     def _on_gsense_config_changed(self, _index: int) -> None:
         """Pixel offset or color permutation changed — reprocess GSense display."""
@@ -1191,43 +1559,17 @@ class PolarViewMainWindow(QMainWindow):
             self._perm_combo.setCurrentIndex(idx + 1)
 
     # -----------------------------------------------------------------
-    # ROI save mode (Create ROI / Clear ROI)
+    # ROI (Create / Clear / Save)
     # -----------------------------------------------------------------
     def _on_create_roi(self) -> None:
-        """Enter polygon drawing mode on the TOP panel to save an ROI."""
+        """Enter polygon drawing mode on the HG NIR panel to save an ROI."""
         if not self._file_loaded:
             return
         self._roi_save_mode = True
-        self._top_panel.set_roi_mode(True)
+        self._middle_panel.set_roi_mode(True)
         self.statusBar().showMessage(
-            "Create ROI: Click points on the TOP image to draw polygon. "
+            "Create ROI: Click points on the HG NIR image to draw polygon. "
             "Right-click or double-click to finish."
-        )
-
-    def _save_roi_to_file(self, vertices: list[tuple[int, int]]) -> None:
-        """Write polygon vertices to a .roi.json sidecar file."""
-        if not self._file_loaded or self._h5_file_index < 0:
-            return
-
-        h5_path = self._h5_files[self._h5_file_index]
-        roi_path = h5_path.with_suffix(".roi.json")
-
-        # Determine image shape (half-resolution from 2×2 subsampling)
-        rows_half = self._h5info.attr.rows // 2
-        cols_half = self._h5info.attr.columns // 2
-
-        data = {
-            "vertices": [list(v) for v in vertices],
-            "image_shape": [rows_half, cols_half],
-            "source_file": h5_path.name,
-        }
-
-        with open(roi_path, "w") as f:
-            json.dump(data, f, indent=2)
-
-        self._update_roi_status()
-        self.statusBar().showMessage(
-            f"ROI saved: {roi_path.name} ({len(vertices)} vertices)"
         )
 
     def _on_clear_roi(self) -> None:
@@ -1261,6 +1603,39 @@ class PolarViewMainWindow(QMainWindow):
         self._update_roi_status()
         self.statusBar().showMessage(f"ROI cleared: {roi_path.name}")
 
+    def _on_roi_selected(self, vertices: list[tuple[int, int]]) -> None:
+        """Handle completed polygon ROI from the HG NIR panel."""
+        if not self._roi_save_mode:
+            return
+        self._roi_save_mode = False
+
+        if not self._file_loaded or self._h5_file_index < 0:
+            return
+
+        h5_path = self._h5_files[self._h5_file_index]
+        roi_path = h5_path.with_suffix(".roi.json")
+
+        # Get the displayed image shape
+        if self._camera_type == CameraType.GSENSE:
+            img_shape = list(self._video_data.hg_nir_raw.shape)
+        else:
+            img_shape = [self._h5info.attr.rows // 2,
+                         self._h5info.attr.columns // 2]
+
+        data = {
+            "vertices": [list(v) for v in vertices],
+            "image_shape": img_shape,
+            "source_file": h5_path.name,
+        }
+
+        with open(roi_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        self._update_roi_status()
+        self.statusBar().showMessage(
+            f"ROI saved: {roi_path.name} ({len(vertices)} vertices)"
+        )
+
     def _update_roi_status(self) -> None:
         """Show or hide the [ROI] status label based on sidecar file existence."""
         if not self._file_loaded or self._h5_file_index < 0:
@@ -1273,6 +1648,57 @@ class PolarViewMainWindow(QMainWindow):
             self._roi_status_label.setText("[ROI]")
         else:
             self._roi_status_label.setText("")
+
+    def _update_tissue_status(self, h5_path: Path) -> None:
+        """Check tissue_log.xlsx for the current file and update borders + label."""
+        panels = [self._top_panel, self._middle_panel,
+                  self._bottom_panel, self._color_panel,
+                  self._overlay_panel]
+
+        xlsx_path = h5_path.parent / "tissue_log.xlsx"
+        if not xlsx_path.exists():
+            self._tissue_label.setText("")
+            for panel in panels:
+                panel.set_border_color(None)
+            return
+
+        # Look up the current filename in the Excel log
+        fname = h5_path.name
+        cancerous = None
+        try:
+            wb = openpyxl.load_workbook(xlsx_path, read_only=True)
+            ws = wb.active
+            for row_idx in range(2, ws.max_row + 1):
+                cell_val = ws.cell(row=row_idx, column=1).value
+                if cell_val and str(cell_val).strip() == fname:
+                    cancerous = int(ws.cell(row=row_idx, column=2).value)
+                    break
+            wb.close()
+        except Exception:
+            pass
+
+        if cancerous is None:
+            self._tissue_label.setText("")
+            for panel in panels:
+                panel.set_border_color(None)
+            return
+
+        from PyQt6.QtGui import QColor
+        if cancerous == 1:
+            color = QColor(255, 0, 0)
+            self._tissue_label.setText("Tissue: Positive")
+            self._tissue_label.setStyleSheet(
+                "font-size: 14px; font-weight: bold; color: red;"
+            )
+        else:
+            color = QColor(0, 180, 0)
+            self._tissue_label.setText("Tissue: Negative")
+            self._tissue_label.setStyleSheet(
+                "font-size: 14px; font-weight: bold; color: green;"
+            )
+
+        for panel in panels:
+            panel.set_border_color(color)
 
     @staticmethod
     def _load_roi_mask(roi_path: Path, image_shape: tuple[int, int]) -> np.ndarray | None:
@@ -1295,360 +1721,6 @@ class PolarViewMainWindow(QMainWindow):
         coords = np.column_stack([xx.ravel(), yy.ravel()])
         mask = poly_path.contains_points(coords).reshape(h, w)
         return mask
-
-    # -----------------------------------------------------------------
-    # HSV scatter plot
-    # -----------------------------------------------------------------
-    _hsv_dialog: HSVScatterDialog | None = None
-
-    def _on_show_hsv(self) -> None:
-        """Enter polygon ROI selection mode on the TOP panel."""
-        if not self._file_loaded:
-            return
-        roi_num = self._roi_spin.value()
-        self.statusBar().showMessage(
-            f"ROI {roi_num}: Click points on the TOP image to draw polygon. "
-            "Right-click or double-click to finish."
-        )
-        self._top_panel.set_roi_mode(True)
-
-    def _on_hold_hsv_changed(self, state: int) -> None:
-        """Clear accumulated HSV data when Hold Data is unchecked."""
-        if state == 0:  # unchecked
-            self._held_hsv_groups = []
-            self._held_hsv_dlg = None
-
-    def _on_show_all_hsv(self) -> None:
-        """Load all UV files, apply ROI + filter + min pixels, plot HSV scatter.
-
-        Negative samples (cancerous=0) and positive samples (cancerous=1)
-        are plotted in different colours.  Uses tissue_log.csv for labels.
-        """
-        from matplotlib.colors import rgb_to_hsv
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-        from matplotlib.figure import Figure
-        from matplotlib.patches import Ellipse
-        from matplotlib.patheffects import Stroke, Normal
-        from polarview.frame_processor import _spike_filter
-
-        if not self._file_loaded or not self._h5_files:
-            QMessageBox.warning(self, "No File", "No file loaded.")
-            return
-
-        h5_dir = self._h5_files[0].parent
-        csv_path = h5_dir / "tissue_log.csv"
-        if not csv_path.exists():
-            QMessageBox.warning(
-                self, "No tissue_log.csv",
-                f"tissue_log.csv not found in:\n{h5_dir}\n\n"
-                "Rename UV files first to generate it.",
-            )
-            return
-
-        # Read tissue_log.csv
-        entries: list[tuple[str, str, int]] = []
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                entries.append((
-                    row["filename"].strip(),
-                    row["tissue_type"].strip(),
-                    int(row["cancerous"]),
-                ))
-
-        if not entries:
-            QMessageBox.warning(self, "Empty CSV", "tissue_log.csv has no entries.")
-            return
-
-        # Filter by selected tissue type / label
-        tissue_filter = self._hsv_tissue_combo.currentText()
-        if tissue_filter == "TUMOR":
-            entries = [(f, t, l) for f, t, l in entries if t == "TUMOR"]
-        elif tissue_filter == "LN":
-            entries = [(f, t, l) for f, t, l in entries if t == "LN"]
-        elif tissue_filter == "ALL LN":
-            entries = [(f, t, l) for f, t, l in entries if t == "LN"]
-        elif tissue_filter == "Pos LN":
-            entries = [(f, t, l) for f, t, l in entries if t == "LN" and l == 1]
-        elif tissue_filter == "Neg LN":
-            entries = [(f, t, l) for f, t, l in entries if t == "LN" and l == 0]
-        # else: "ALL" — keep all entries
-
-        if not entries:
-            QMessageBox.warning(
-                self, "No Matches",
-                f"No {tissue_filter} entries found in tissue_log.csv.",
-            )
-            return
-
-        # Current GUI settings
-        median_tap = self._get_filter_tap()
-        spike_tap = self._get_spike_tap()
-        min_pixels = self._min_pixels_spin.value()
-        top_low = self._top_thresh.low / 100.0
-
-        neg_pixels_all: list[np.ndarray] = []  # list of (N, 3) RGB arrays
-        pos_pixels_all: list[np.ndarray] = []
-
-        for i, (fname, ttype, label) in enumerate(entries):
-            self.statusBar().showMessage(
-                f"Show All HSV: {i + 1}/{len(entries)} — {fname}"
-            )
-            QApplication.processEvents()
-
-            fp = h5_dir / fname
-            if not fp.exists():
-                continue
-
-            try:
-                info = load_h5(fp)
-                raw_frame = info.raw_data[:, :, :, 0].astype(np.float64)
-                norm = 2 ** info.attr.norm_bits
-
-                top_ch = raw_frame[::2, ::2, 2] / norm
-                mid_ch = raw_frame[::2, ::2, 1] / norm
-                bot_ch = raw_frame[::2, ::2, 0] / norm
-
-                # Apply selected filter
-                if spike_tap > 0:
-                    top_ch = _spike_filter(top_ch, spike_tap)
-                    mid_ch = _spike_filter(mid_ch, spike_tap)
-                    bot_ch = _spike_filter(bot_ch, spike_tap)
-                if median_tap > 0:
-                    top_ch = median_filter(top_ch, size=(median_tap, median_tap),
-                                           mode="constant", cval=0.0)
-                    mid_ch = median_filter(mid_ch, size=(median_tap, median_tap),
-                                           mode="constant", cval=0.0)
-                    bot_ch = median_filter(bot_ch, size=(median_tap, median_tap),
-                                           mode="constant", cval=0.0)
-
-                # Build COLOR composite [0,1]: Red=bottom, Green=middle, Blue=top
-                def _norm(ch):
-                    lo, hi = ch.min(), ch.max()
-                    return (ch - lo) / (hi - lo) if hi > lo else np.zeros_like(ch)
-
-                color = np.stack([_norm(bot_ch), _norm(mid_ch), _norm(top_ch)], axis=-1)
-
-                # Load ROI mask
-                roi_path = fp.with_suffix(".roi.json")
-                roi_mask = self._load_roi_mask(roi_path, top_ch.shape)
-
-                # Build pixel mask: within ROI, above Lo, in clusters >= min_pixels
-                above_lo = top_ch >= top_low
-                if roi_mask is not None:
-                    above_lo = above_lo & roi_mask
-
-                labeled_arr, n_comp = ndimage_label(above_lo)
-                keep = np.zeros_like(above_lo)
-                for comp_id in range(1, n_comp + 1):
-                    if int(np.sum(labeled_arr == comp_id)) >= min_pixels:
-                        keep[labeled_arr == comp_id] = True
-
-                pixels = color[keep]  # (N, 3)
-                if pixels.size == 0:
-                    continue
-
-                if label == 1:
-                    pos_pixels_all.append(pixels)
-                else:
-                    neg_pixels_all.append(pixels)
-
-            except Exception:
-                continue
-
-        if not neg_pixels_all and not pos_pixels_all:
-            QMessageBox.warning(self, "No Data", "No valid pixels found across files.")
-            return
-
-        # Convert collected pixels to HSV groups
-        _HOLD_COLORS = [
-            "blue", "red", "green", "purple", "orange",
-            "brown", "magenta", "cyan", "olive", "deeppink",
-        ]
-
-        new_groups: list[tuple[np.ndarray, str, str, int]] = []
-        for group_pixels, default_color, group_label in [
-            (neg_pixels_all, "blue", f"{tissue_filter} Neg"),
-            (pos_pixels_all, "red", f"{tissue_filter} Pos"),
-        ]:
-            if not group_pixels:
-                continue
-            all_rgb = np.concatenate(group_pixels, axis=0)
-            all_rgb = np.clip(all_rgb, 0.0, 1.0)
-            hsv = rgb_to_hsv(all_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
-            new_groups.append((hsv, default_color, group_label, len(all_rgb)))
-
-        hold_mode = self._hold_hsv_cb.isChecked()
-
-        if hold_mode:
-            # Assign unique colors from palette based on accumulated count
-            for hsv, _, group_label, n_px in new_groups:
-                idx = len(self._held_hsv_groups) % len(_HOLD_COLORS)
-                color = _HOLD_COLORS[idx]
-                self._held_hsv_groups.append((hsv, color, group_label, n_px))
-            group_data = self._held_hsv_groups
-        else:
-            # Fresh plot — use default red/blue colors
-            self._held_hsv_groups = []
-            group_data = new_groups
-
-        # Build or reuse dialog
-        if hold_mode and self._held_hsv_dlg is not None:
-            try:
-                self._held_hsv_dlg.isVisible()  # test if still alive
-                dlg = self._held_hsv_dlg
-                # Clear existing figure
-                dlg.findChild(FigureCanvasQTAgg).figure.clear()
-                fig = dlg.findChild(FigureCanvasQTAgg).figure
-                canvas = dlg.findChild(FigureCanvasQTAgg)
-            except RuntimeError:
-                # Dialog was closed / deleted
-                hold_mode = False
-                self._held_hsv_dlg = None
-
-        if not hold_mode or self._held_hsv_dlg is None:
-            dlg = QDialog(self)
-            dlg.setMinimumSize(1200, 550)
-            fig = Figure(figsize=(13, 5.5), dpi=100)
-            canvas = FigureCanvasQTAgg(fig)
-            layout = QVBoxLayout()
-            layout.addWidget(canvas)
-            dlg.setLayout(layout)
-            if hold_mode:
-                self._held_hsv_dlg = dlg
-
-        title_parts = sorted({g[2] for g in group_data})
-        dlg.setWindowTitle(f"HSV Scatter — {' | '.join(title_parts)}")
-
-        ax2d = fig.add_subplot(121)
-        ax3d = fig.add_subplot(122, projection="3d")
-
-        halo = [Stroke(linewidth=3, foreground="white"), Normal()]
-
-        # --- 2D: Hue vs Saturation ---
-        for hsv, color_name, group_label, n_px in group_data:
-            hue = hsv[:, 0] * 360
-            sat = hsv[:, 1]
-
-            ax2d.scatter(sat, hue, c=color_name, s=4, alpha=0.3,
-                         edgecolors="none", zorder=1)
-
-            mean_sat = float(np.mean(sat))
-            mean_hue = float(np.mean(hue))
-            std_sat = float(np.std(sat))
-            std_hue = float(np.std(hue))
-
-            ax2d.plot(mean_sat, mean_hue, "x", color="black",
-                      markersize=10, markeredgewidth=2, zorder=10,
-                      path_effects=halo)
-
-            ax2d.scatter([], [], c=color_name, s=40, edgecolors="none",
-                         label=f"{group_label} ({n_px} px): "
-                               f"S={mean_sat:.3f}, H={mean_hue:.1f}°")
-
-            ellipse = Ellipse(
-                (mean_sat, mean_hue),
-                width=4 * std_sat, height=4 * std_hue,
-                fill=False, edgecolor=color_name, linewidth=2,
-                linestyle="--", zorder=9, path_effects=halo,
-            )
-            ax2d.add_patch(ellipse)
-
-        ax2d.set_xlabel("Saturation")
-        ax2d.set_ylabel("Hue (degrees)")
-        ax2d.set_xlim(0, 1)
-        ax2d.set_ylim(0, 360)
-        ax2d.set_title(f"H vs S — {len(group_data)} group(s)")
-        ax2d.legend(fontsize=7, loc="upper right")
-        ax2d.grid(True, alpha=0.3)
-
-        # --- 3D: Hue vs Saturation vs Value ---
-        for hsv, color_name, group_label, n_px in group_data:
-            hue = hsv[:, 0] * 360
-            sat = hsv[:, 1]
-            val = hsv[:, 2]
-
-            max_pts = 5000
-            if len(hue) > max_pts:
-                idx = np.random.choice(len(hue), max_pts, replace=False)
-                hue_s, sat_s, val_s = hue[idx], sat[idx], val[idx]
-            else:
-                hue_s, sat_s, val_s = hue, sat, val
-
-            ax3d.scatter(sat_s, hue_s, val_s, c=color_name, s=4, alpha=0.3,
-                         edgecolors="none", label=f"{group_label} ({n_px} px)")
-
-        ax3d.set_xlabel("Saturation")
-        ax3d.set_ylabel("Hue (°)")
-        ax3d.set_zlabel("Value")
-        ax3d.set_xlim(0, 1)
-        ax3d.set_ylim(0, 360)
-        ax3d.set_zlim(0, 1)
-        ax3d.set_title("H vs S vs V")
-        ax3d.legend(fontsize=7, loc="upper right")
-
-        fig.tight_layout()
-        canvas.draw()
-
-        self.statusBar().showMessage(
-            f"Show All HSV: {len(neg_pixels_all)} neg files, "
-            f"{len(pos_pixels_all)} pos files"
-        )
-        dlg.show()
-
-    def _on_top_roi_selected(self, vertices: list[tuple[int, int]]) -> None:
-        """Handle polygon ROI — save to file or add to HSV scatter."""
-        # If in ROI save mode, save to file and return
-        if self._roi_save_mode:
-            self._roi_save_mode = False
-            self._save_roi_to_file(vertices)
-            return
-
-        from matplotlib.path import Path as MplPath
-
-        roi_num = self._roi_spin.value()
-        self.statusBar().showMessage(
-            f"ROI {roi_num}: {len(vertices)} vertices"
-        )
-        color_data = self._video_data.color  # (H, W, 3), [0, 1]
-        if color_data is None:
-            return
-
-        h, w = color_data.shape[:2]
-
-        # Build polygon path and mask
-        poly_path = MplPath(vertices)
-        yy, xx = np.mgrid[:h, :w]
-        coords = np.column_stack([xx.ravel(), yy.ravel()])
-        mask = poly_path.contains_points(coords).reshape(h, w)
-
-        # Only keep pixels where top channel is within the TOP lo-hi range
-        raw = self._video_data.raw_single_frame_double
-        top_ch = raw[::2, ::2, 2] / (2 ** self._h5info.attr.norm_bits)
-        top_low = self._top_thresh.low / 100.0
-        top_high = self._top_thresh.high / 100.0
-        in_range = (top_ch >= top_low) & (top_ch <= top_high)
-        mask = mask & in_range
-
-        pixels = color_data[mask]  # (N, 3), [0, 1]
-        if pixels.size == 0:
-            QMessageBox.warning(self, "Empty ROI", "Selected region has no pixels.")
-            return
-
-        # Create dialog on first ROI, reuse for subsequent ones
-        if self._hsv_dialog is None or not self._hsv_dialog.isVisible():
-            self._hsv_dialog = HSVScatterDialog(parent=self)
-            self._hsv_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            self._hsv_dialog.destroyed.connect(self._on_hsv_dialog_closed)
-            self._hsv_dialog.show()
-
-        self._hsv_dialog.add_roi(pixels, f"ROI {roi_num}")
-
-        # Auto-increment ROI number for convenience
-        self._roi_spin.setValue(roi_num + 1)
-
-    def _on_hsv_dialog_closed(self) -> None:
-        self._hsv_dialog = None
 
     # -----------------------------------------------------------------
     # Processing helpers
@@ -1690,7 +1762,7 @@ class PolarViewMainWindow(QMainWindow):
             else:
                 self._process_and_display_foveon()
         except Exception as exc:
-            traceback.print_exc()
+
             self.statusBar().showMessage(f"Display error: {exc}")
 
     def _process_and_display_foveon(self) -> None:
@@ -1770,6 +1842,37 @@ class PolarViewMainWindow(QMainWindow):
         color = np.clip(color, 0.0, 1.0) * 255.0
         self._color_panel.set_image(color)
 
+        # Cache displayed images so Save Images exports exactly what's on screen
+        self._displayed_images = {
+            "TOP Image": top_img,
+            "MIDDLE Image": self._video_data.middle,
+            "BOTTOM Image": self._video_data.bottom,
+            "COLOR Image": color,
+        }
+
+    @staticmethod
+    def _build_nir_color_overlay(
+        hg_color: np.ndarray,
+        hg_nir: np.ndarray,
+        hg_nir_raw: np.ndarray,
+        nir_low_pct: float,
+        nir_high_pct: float,
+        alpha: float,
+    ) -> np.ndarray:
+        """Blend HG NIR over HG Color where ``hg_nir_raw`` is in the [Lo, Hi] band.
+
+        Outside the band the overlay is fully transparent (color shows through).
+        ``alpha`` is the NIR opacity in [0, 1] within the band.
+        """
+        nir_low = nir_low_pct / 100.0
+        nir_high = nir_high_pct / 100.0
+        in_band = (hg_nir_raw >= nir_low) & (hg_nir_raw <= nir_high)
+        out = hg_color.copy()
+        out[in_band] = (
+            alpha * hg_nir[in_band] + (1.0 - alpha) * hg_color[in_band]
+        )
+        return out
+
     @staticmethod
     def _apply_color_threshold(
         color_raw: np.ndarray, low_pct: float, high_pct: float
@@ -1816,7 +1919,43 @@ class PolarViewMainWindow(QMainWindow):
         self._top_panel.set_image(hg_color)
 
         # HG NIR: already [0, 255] from the processing pipeline
-        self._middle_panel.set_image(self._video_data.hg_nir)
+        hg_nir_img = self._video_data.hg_nir.copy()
+
+        if self._mask_pixels_cb.isChecked():
+            # Mask pixels: keep only pixels above the NIR Lo threshold,
+            # within ROI, in contiguous regions >= min_pixels.
+            nir_ch = self._video_data.hg_nir_raw  # [0, 1]
+            nir_low = self._middle_thresh.low / 100.0
+            above_lo = nir_ch >= nir_low
+
+            # Restrict to ROI if available
+            roi_mask = None
+            if self._h5_file_index >= 0:
+                h5_path = self._h5_files[self._h5_file_index]
+                roi_path = h5_path.with_suffix(".roi.json")
+                roi_mask = self._load_roi_mask(roi_path, hg_nir_img.shape[:2])
+
+            if roi_mask is not None:
+                above_lo = above_lo & roi_mask
+
+            # Keep only contiguous regions >= min_pixels
+            min_px = self._min_pixels_spin.value()
+            labeled_arr, n_comp = ndimage_label(above_lo)
+            keep = np.zeros_like(above_lo)
+            for comp_id in range(1, n_comp + 1):
+                if int(np.sum(labeled_arr == comp_id)) >= min_px:
+                    keep[labeled_arr == comp_id] = True
+
+            hg_nir_img[~keep] = 0.0
+
+        elif self._uv_roi_cb.isChecked() and self._h5_file_index >= 0:
+            h5_path = self._h5_files[self._h5_file_index]
+            roi_path = h5_path.with_suffix(".roi.json")
+            roi_mask = self._load_roi_mask(roi_path, hg_nir_img.shape[:2])
+            if roi_mask is not None:
+                hg_nir_img[~roi_mask] = 0.0
+
+        self._middle_panel.set_image(hg_nir_img)
 
         # LG Color
         lg_color = self._apply_color_threshold(
@@ -1826,4 +1965,26 @@ class PolarViewMainWindow(QMainWindow):
         self._bottom_panel.set_image(lg_color)
 
         # LG NIR: already [0, 255]
-        self._color_panel.set_image(self._video_data.lg_nir)
+        lg_nir_img = self._video_data.lg_nir.copy()
+        self._color_panel.set_image(lg_nir_img)
+
+        # HG Color + NIR overlay (5th panel).  Uses the unmasked threshold-clamped
+        # HG NIR so the overlay is independent of "Mask UV Pixels" / "Display UV ROI".
+        overlay = self._build_nir_color_overlay(
+            hg_color, self._video_data.hg_nir, self._video_data.hg_nir_raw,
+            self._middle_thresh.low, self._middle_thresh.high,
+            self._overlay_alpha(),
+        )
+        self._overlay_panel.set_image(overlay)
+
+        # Cache displayed images so Save Images exports exactly what's on screen
+        self._displayed_images = {
+            "HG Color": hg_color,
+            "HG NIR": hg_nir_img,
+            "LG Color": lg_color,
+            "LG NIR": lg_nir_img,
+            "HG Color+NIR": overlay,
+        }
+
+        # Push HDR-fused frame to any open HDR viewer windows.
+        self._update_hdr_views()

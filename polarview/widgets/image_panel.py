@@ -35,6 +35,7 @@ class ImagePanel(QWidget):
         )
 
         self._pixmap: QPixmap | None = None
+        self._border_color: QColor | None = None
 
         # ROI polygon selection state
         self._roi_mode = False
@@ -72,6 +73,21 @@ class ImagePanel(QWidget):
         qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         self._pixmap = QPixmap.fromImage(qimg.copy())
         self._apply_scaled_pixmap()
+
+    def set_border_color(self, color: QColor | None) -> None:
+        """Fill the image label background with *color* so the image sits
+        inside a solid-colored box.  Pass *None* to remove."""
+        self._border_color = color
+        if color is not None:
+            self._image_label.setAutoFillBackground(True)
+            pal = self._image_label.palette()
+            pal.setColor(pal.ColorRole.Window, color)
+            self._image_label.setPalette(pal)
+            # Add a small margin so the color is visible around the image
+            self._image_label.setContentsMargins(4, 4, 4, 4)
+        else:
+            self._image_label.setAutoFillBackground(False)
+            self._image_label.setContentsMargins(0, 0, 0, 0)
 
     def set_roi_mode(self, enabled: bool) -> None:
         """Enable or disable polygon ROI selection on this panel."""
@@ -131,7 +147,7 @@ class ImagePanel(QWidget):
         if self._pixmap is None:
             return
         scaled = self._pixmap.scaled(
-            self._image_label.size(),
+            self._image_label.contentsRect().size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )

@@ -32,6 +32,8 @@ def _detect_camera_type(cam_group: h5py.Group) -> tuple[CameraType, str]:
     # Check imager attribute (older firmware)
     imager = str(attrs.get("imager", ""))
     if imager:
+        if "GS " in imager or "GSense" in imager:
+            return CameraType.GSENSE, imager
         if "X3" in imager or "Stacked" in imager:
             return CameraType.FOVEON, imager
 
@@ -68,7 +70,6 @@ def _reorder_foveon(raw: np.ndarray) -> np.ndarray:
     If two dims are both 3, the one that matches known channel count is
     treated as channels; the other as frames.
     """
-    print(f"[h5_loader] Foveon raw shape: {raw.shape}, ndim={raw.ndim}")
 
     # ---- 3-D: single frame with 3 channels ----
     if raw.ndim == 3:
@@ -86,7 +87,6 @@ def _reorder_foveon(raw: np.ndarray) -> np.ndarray:
         raw = np.transpose(raw, [spatial[0], spatial[1], ch_axis])
         # Add a frames axis → (rows, cols, 3, 1)
         raw = raw[:, :, :, np.newaxis]
-        print(f"[h5_loader] 3-D → expanded to 4-D: {raw.shape}")
         return raw
 
     # ---- 4-D ----
@@ -126,12 +126,8 @@ def _reorder_foveon(raw: np.ndarray) -> np.ndarray:
         # Final safety check: axis 2 must be 3 (channels).
         # If it ended up as axis 3 instead, swap.
         if raw.shape[2] != NUM_CHANNELS and raw.shape[3] == NUM_CHANNELS:
-            print("[h5_loader] Swapping axes 2↔3 to fix channel/frame order")
             raw = np.swapaxes(raw, 2, 3)
 
-        print(f"[h5_loader] 4-D reordered: {raw.shape}  "
-              f"(rows={raw.shape[0]}, cols={raw.shape[1]}, "
-              f"ch={raw.shape[2]}, frames={raw.shape[3]})")
         return raw
 
     raise ValueError(f"Expected 3-D or 4-D data, got {raw.ndim}-D")
@@ -162,7 +158,6 @@ def load_h5(file_path: str | Path) -> H5Info:
 
         # --- Detect camera type ---
         camera_type, camera_desc = _detect_camera_type(cam_group)
-        print(f"[h5_loader] Camera type: {camera_type.name}  ({camera_desc})")
 
         # --- Load and process frames ---
         raw: np.ndarray = cam_group["frames"][()]
@@ -181,12 +176,8 @@ def load_h5(file_path: str | Path) -> H5Info:
             info.raw_data = raw // 16
             bit_shift = 4
             norm_bits = 12
-            print(f"[h5_loader] GSense reordered: {info.raw_data.shape}  "
-                  f"(rows={info.raw_data.shape[0]}, cols={info.raw_data.shape[1]}, "
-                  f"ch={info.raw_data.shape[2]}, frames={info.raw_data.shape[3]})")
         else:
             # Unknown camera — try Foveon-style reorder as fallback
-            print(f"[h5_loader] Unknown camera, attempting Foveon-style reorder")
             raw = _reorder_foveon(raw)
             info.raw_data = raw // 4
             bit_shift = 2
@@ -195,8 +186,13 @@ def load_h5(file_path: str | Path) -> H5Info:
         # --- Frame rate from integration-time ---
         frame_rate = 10.0
         try:
+            integ_key = None
             if "integration-time" in cam_group:
-                integ_us = cam_group["integration-time"][()].astype(np.float64)
+                integ_key = "integration-time"
+            elif "integration-time-expected" in cam_group:
+                integ_key = "integration-time-expected"
+            if integ_key:
+                integ_us = cam_group[integ_key][()].astype(np.float64)
                 if integ_us.size > 0:
                     mean_integ = float(np.mean(integ_us))
                     if mean_integ > 0:
